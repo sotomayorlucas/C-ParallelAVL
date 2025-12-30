@@ -298,6 +298,77 @@ void flowshield_simulate_udp_amplification(
     }
 }
 
+/* Pre-computed collision keys for efficient hotspot simulation */
+typedef struct {
+    FlowKey* keys;
+    size_t count;
+    size_t capacity;
+} CollisionKeyCache;
+
+static CollisionKeyCache* g_collision_cache = NULL;
+static size_t g_collision_cache_shard = 0;
+static size_t g_collision_cache_num_shards = 0;
+
+static void precompute_collision_keys(size_t target_shard, size_t num_shards, size_t count) {
+    /* Check if cache is valid */
+    if (g_collision_cache &&
+        g_collision_cache_shard == target_shard &&
+        g_collision_cache_num_shards == num_shards &&
+        g_collision_cache->count >= count) {
+        return;  /* Cache hit */
+    }
+
+    /* Free old cache */
+    if (g_collision_cache) {
+        free(g_collision_cache->keys);
+        free(g_collision_cache);
+    }
+
+    /* Allocate new cache */
+    g_collision_cache = malloc(sizeof(CollisionKeyCache));
+    g_collision_cache->capacity = count * 2;
+    g_collision_cache->keys = malloc(g_collision_cache->capacity * sizeof(FlowKey));
+    g_collision_cache->count = 0;
+
+    g_collision_cache_shard = target_shard;
+    g_collision_cache_num_shards = num_shards;
+
+    /*
+     * Efficient collision generation:
+     * Instead of random search, use sequential IPs which is faster
+     * and creates unique flows that all map to the same shard.
+     */
+    uint64_t rng = 0x12345678DEADBEEF;
+    uint32_t base_ip = 0x0A000000;  /* 10.0.0.0 */
+
+    for (size_t attempts = 0; g_collision_cache->count < count && attempts < count * 20; attempts++) {
+        FlowKey key;
+        key.src_ip = base_ip + (attempts & 0xFFFFFF);
+        key.dst_ip = 0xC0A80001 + ((attempts >> 8) & 0xFFFF);  /* 192.168.x.x */
+        key.src_port = 1024 + (attempts % 64000);
+        key.dst_port = 80;
+        key.protocol = PROTO_TCP;
+
+        int64_t hash = flow_key_hash(&key);
+        if ((size_t)((hash & 0x7FFFFFFFFFFFFFFF) % num_shards) == target_shard) {
+            g_collision_cache->keys[g_collision_cache->count++] = key;
+        }
+
+        /* Also try with random variation */
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+
+        key.src_port = 1024 + (rng % 64000);
+        hash = flow_key_hash(&key);
+        if ((size_t)((hash & 0x7FFFFFFFFFFFFFFF) % num_shards) == target_shard) {
+            if (g_collision_cache->count < g_collision_cache->capacity) {
+                g_collision_cache->keys[g_collision_cache->count++] = key;
+            }
+        }
+    }
+}
+
 void flowshield_simulate_hotspot_attack(
     FlowShield* engine,
     size_t target_shard,
@@ -309,33 +380,27 @@ void flowshield_simulate_hotspot_attack(
     if (target_shard >= num_shards) target_shard = 0;
 
     /*
-     * Generate keys that all hash to the same shard.
-     * This is an algorithmic complexity attack!
+     * PRE-COMPUTE collision keys for efficient hotspot attack.
      *
-     * With STATIC_HASH routing, all these will serialize on one shard.
-     * With LOAD_AWARE routing, they'll be distributed across shards.
+     * This simulates an attacker who has:
+     * 1. Reverse-engineered the hash function
+     * 2. Pre-computed keys that collide to the same shard
+     * 3. Launches a coordinated attack
+     *
+     * With STATIC_HASH: All keys serialize on one shard mutex
+     * With LOAD_AWARE: Keys are redistributed across shards
      */
-    for (size_t i = 0; i < num_packets; i++) {
-        /* Find a key that hashes to target shard */
-        FlowKey key;
-        do {
-            key.src_ip = random_ip(&engine->rng_state);
-            key.dst_ip = random_ip(&engine->rng_state);
-            key.src_port = random_port(&engine->rng_state);
-            key.dst_port = random_port(&engine->rng_state);
-            key.protocol = PROTO_TCP;
+    precompute_collision_keys(target_shard, num_shards, num_packets);
 
-            int64_t hash = flow_key_hash(&key);
-            /* Check if this would go to target shard with static routing */
-            if ((size_t)(hash % (int64_t)num_shards) == target_shard) {
-                break;
-            }
-        } while (1);
+    /* Use pre-computed keys */
+    for (size_t i = 0; i < num_packets; i++) {
+        size_t key_idx = i % g_collision_cache->count;
+        FlowKey* key = &g_collision_cache->keys[key_idx];
 
         flowshield_process_packet(engine,
-            key.src_ip, key.dst_ip,
-            key.src_port, key.dst_port,
-            key.protocol, 128, 0x02);
+            key->src_ip, key->dst_ip,
+            key->src_port, key->dst_port,
+            key->protocol, 128, 0x02);
     }
 }
 
