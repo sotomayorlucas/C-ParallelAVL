@@ -1,0 +1,7 @@
+# Build artifacts
+bin/
+*.o
+
+# Editor files
+*.swp
+*~
