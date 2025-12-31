@@ -42,6 +42,14 @@ extern "C" {
 
 typedef struct FlowShield FlowShield;
 
+/* AI backend selection */
+typedef enum {
+    FLOWSHIELD_AI_OFF,      /* No AI (rule-based only) */
+    FLOWSHIELD_AI_AUTO,     /* Auto-detect (Hailo → CPU) */
+    FLOWSHIELD_AI_HAILO,    /* Force Hailo-8L accelerator */
+    FLOWSHIELD_AI_CPU       /* Force CPU inference */
+} FlowShieldAIMode;
+
 /* Engine configuration */
 typedef struct {
     size_t num_shards;              /* Number of AVL shards */
@@ -49,6 +57,11 @@ typedef struct {
     DetectionConfig detection;       /* Detection thresholds */
     bool enable_learning;            /* Start in learning mode */
     uint32_t learning_duration_sec;  /* Learning period */
+
+    /* AI Configuration */
+    FlowShieldAIMode ai_mode;       /* AI backend mode */
+    float ai_anomaly_threshold;      /* AI anomaly threshold (0.0-1.0) */
+    bool ai_online_learning;         /* Enable online learning */
 } FlowShieldConfig;
 
 /* Default configuration */
@@ -58,8 +71,20 @@ static inline FlowShieldConfig flowshield_config_default(void) {
         .routing                = ROUTER_LOAD_AWARE,  /* Adversary-resistant! */
         .detection              = detection_config_default(),
         .enable_learning        = false,
-        .learning_duration_sec  = 60
+        .learning_duration_sec  = 60,
+        .ai_mode                = FLOWSHIELD_AI_OFF,
+        .ai_anomaly_threshold   = 0.85f,
+        .ai_online_learning     = false
     };
+}
+
+/* AI-enabled configuration (for Raspberry Pi 5 with Hailo-8L) */
+static inline FlowShieldConfig flowshield_config_ai(void) {
+    FlowShieldConfig config = flowshield_config_default();
+    config.ai_mode = FLOWSHIELD_AI_AUTO;
+    config.ai_anomaly_threshold = 0.80f;
+    config.ai_online_learning = true;
+    return config;
 }
 
 /* ============================================================================
@@ -279,6 +304,72 @@ void flowshield_print_summary(FlowShield* engine);
  * @param clear_screen  Whether to clear screen before printing
  */
 void flowshield_print_dashboard(FlowShield* engine, bool clear_screen);
+
+/* ============================================================================
+ * AI / Machine Learning (Optional - for Hailo-8L on Raspberry Pi 5)
+ * ============================================================================ */
+
+#ifdef HAVE_AI
+#include "ai_inference.h"
+
+/**
+ * Get AI engine (NULL if AI is disabled).
+ */
+AIEngine* flowshield_get_ai_engine(FlowShield* engine);
+
+/**
+ * Run AI-based anomaly detection on a single flow.
+ *
+ * @param engine        FlowShield instance
+ * @param key           Flow key
+ * @param stats         Flow statistics
+ * @param out_result    AI inference result
+ * @return              true if anomaly detected
+ */
+bool flowshield_ai_analyze_flow(
+    FlowShield* engine,
+    const FlowKey* key,
+    const FlowStats* stats,
+    void* out_result  /* AIInferenceResult* */
+);
+
+/**
+ * Run AI analysis on all current flows.
+ *
+ * @return              Number of AI-detected anomalies
+ */
+size_t flowshield_ai_analyze_all(FlowShield* engine);
+
+/**
+ * Get AI engine statistics.
+ */
+void flowshield_get_ai_stats(FlowShield* engine, void* out_stats);
+
+/**
+ * Print AI dashboard showing inference stats and detections.
+ */
+void flowshield_print_ai_dashboard(FlowShield* engine);
+
+#endif /* HAVE_AI */
+
+/* ============================================================================
+ * Platform Detection
+ * ============================================================================ */
+
+/**
+ * Check if running on Raspberry Pi 5.
+ */
+bool flowshield_is_raspberry_pi5(void);
+
+/**
+ * Check if Hailo-8L accelerator is available.
+ */
+bool flowshield_has_hailo(void);
+
+/**
+ * Get platform info string.
+ */
+const char* flowshield_get_platform_info(void);
 
 #ifdef __cplusplus
 }
