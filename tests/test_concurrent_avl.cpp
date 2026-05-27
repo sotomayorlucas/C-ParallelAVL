@@ -212,6 +212,61 @@ void test_concurrent_readers_and_writers() {
 // Visibility: every committed insert must eventually be visible to a
 // contains() call started AFTER the insert returns.
 // =====================================================================
+// =====================================================================
+// Fase 1b: AVL balance (Bronson concurrent rotations).
+// =====================================================================
+void test_avl_balance_ascending() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 1000; ++i) t.insert(i, i);
+    EXPECT(t.size() == 1000);
+    EXPECT(t.debug_check_avl_invariants());
+    // AVL bound: 1.44 * log2(n+2). For n=1000, that's ~15.
+    EXPECT(t.debug_root_height() <= 16);
+    for (i64 i = 0; i < 1000; ++i) EXPECT(t.contains(i));
+}
+
+void test_avl_balance_descending() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 999; i >= 0; --i) t.insert(i, i);
+    EXPECT(t.size() == 1000);
+    EXPECT(t.debug_check_avl_invariants());
+    EXPECT(t.debug_root_height() <= 16);
+    for (i64 i = 0; i < 1000; ++i) EXPECT(t.contains(i));
+}
+
+void test_avl_balance_random() {
+    pavl::concurrent_avl<i64, i64> t;
+    std::mt19937_64 rng(42);
+    std::vector<i64> keys;
+    for (int i = 0; i < 5000; ++i) keys.push_back(i);
+    std::shuffle(keys.begin(), keys.end(), rng);
+    for (auto k : keys) t.insert(k, k);
+    EXPECT(t.size() == 5000);
+    EXPECT(t.debug_check_avl_invariants());
+    EXPECT(t.debug_root_height() <= 20);  // 1.44 * log2(5000) ≈ 17.6
+    for (i64 i = 0; i < 5000; ++i) EXPECT(t.contains(i));
+}
+
+void test_avl_balance_concurrent() {
+    pavl::concurrent_avl<i64, i64> t;
+    constexpr int NT = 8;
+    constexpr int PER = 2000;
+    {
+        std::vector<std::jthread> ws;
+        for (int tid = 0; tid < NT; ++tid) {
+            ws.emplace_back([&, tid] {
+                for (int i = 0; i < PER; ++i) {
+                    t.insert(static_cast<i64>(tid) * PER + i, 0);
+                }
+            });
+        }
+    }
+    EXPECT(t.size() == NT * PER);
+    EXPECT(t.debug_check_avl_invariants());
+    EXPECT(t.debug_root_height() <= 22);  // 1.44 * log2(16000) ≈ 20
+    for (i64 k = 0; k < NT * PER; ++k) EXPECT(t.contains(k));
+}
+
 void test_insert_visible_after_return() {
     pavl::concurrent_avl<i64, i64> t;
     constexpr int NT = 8;
@@ -255,6 +310,12 @@ int main() {
     RUN(concurrent_overlapping_inserts);
     RUN(concurrent_readers_and_writers);
     RUN(insert_visible_after_return);
+
+    std::cout << "\n=== concurrent_avl Fase 1b — balance ===\n";
+    RUN(avl_balance_ascending);
+    RUN(avl_balance_descending);
+    RUN(avl_balance_random);
+    RUN(avl_balance_concurrent);
 
     std::cout << std::format("\n=== Results ===\nPassed: {}\nFailed: {}\n",
                              tests_passed, tests_failed);

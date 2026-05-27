@@ -71,6 +71,7 @@ enum class dir : std::uint8_t { left = 0, right = 1 };
 // concurrent_avl<K, V>
 // =====================================================================
 template <avl_key Key, avl_value Value>
+    requires std::default_initializable<Key> && std::default_initializable<Value>
 class concurrent_avl {
 public:
     using key_type   = Key;
@@ -81,7 +82,7 @@ private:
     using dir   = detail::cavl::dir;
 
     struct node {
-        const Key key;
+        Key       key;
         Value     value;
 
         // Children read by readers without locks. Writers store under
@@ -105,6 +106,10 @@ private:
         // and during rotation on every node whose pointers change.
         std::mutex lock;
 
+        // Sentinel constructor used by holder_ only; key/value never
+        // examined for the holder (its descent never compares against it).
+        node() = default;
+
         template <typename K, typename V>
         node(K&& k, V&& v) : key{std::forward<K>(k)}, value{std::forward<V>(v)} {}
 
@@ -116,10 +121,17 @@ private:
         }
     };
 
-    // Root pointer. Initially nullptr; on first insert the new node
-    // becomes root atomically under root_lock_.
-    std::atomic<node*> root_{nullptr};
-    std::mutex         root_lock_;
+    // Sentinel "root holder". holder_.right is the real root of the
+    // tree. holder_.left is never used. The descent always starts here,
+    // with dir::right, validated against holder_.changeOVL — this is
+    // the Bronson trick that lets a reader detect when a root rotation
+    // moved the actual root, since holder_.changeOVL bumps whenever the
+    // root's identity changes (rotation that re-roots, first insert).
+    //
+    // holder_.key/value are never compared with user keys; the descent
+    // always goes right at the holder regardless. We do require Key and
+    // Value to be default-initialisable so the holder can construct.
+    mutable node holder_{};
 
     // Approximate size: incremented inside the parent lock on a new
     // insertion, never decremented in Fase 1a. relaxed is fine — it's
@@ -134,9 +146,7 @@ public:
     concurrent_avl& operator=(concurrent_avl&&) = delete;
 
     ~concurrent_avl() {
-        // Single-threaded teardown — caller is responsible for ensuring
-        // no readers are still alive. EBR (Fase 3) will lift this.
-        destroy_subtree(root_.load(std::memory_order_relaxed));
+        destroy_subtree(holder_.right.load(std::memory_order_relaxed));
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
@@ -144,14 +154,37 @@ public:
     }
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
 
+    // Debug helpers — only valid in a quiesced (single-threaded) state.
+    [[nodiscard]] std::int32_t debug_root_height() const noexcept {
+        node* r = holder_.right.load(std::memory_order_acquire);
+        return r ? r->height.load(std::memory_order_acquire) : 0;
+    }
+    [[nodiscard]] bool debug_check_avl_invariants() const noexcept {
+        return debug_check_avl(holder_.right.load(std::memory_order_acquire)) >= 0;
+    }
+private:
+    [[nodiscard]] static std::int32_t debug_check_avl(const node* n) noexcept {
+        if (!n) return 0;
+        const auto hl = debug_check_avl(n->left.load(std::memory_order_acquire));
+        const auto hr = debug_check_avl(n->right.load(std::memory_order_acquire));
+        if (hl < 0 || hr < 0) return -1;
+        if (std::abs(hl - hr) > 1) return -1;
+        const auto computed = 1 + std::max(hl, hr);
+        if (computed != n->height.load(std::memory_order_acquire)) return -1;
+        return computed;
+    }
+public:
+
     // =================================================================
     // Lookup: validating descent. No locks.
     // =================================================================
     [[nodiscard]] bool contains(const Key& key) const {
-        while (true) {  // outer retry: root changes are rare but possible
-            node* root = root_.load(std::memory_order_acquire);
-            if (!root) return false;
-            const auto r = attempt_get(nullptr, 0, root, key);
+        while (true) {
+            const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
+            // The descent's first "edge" is holder_.right; the parent
+            // is the holder itself and its OVL is what we just captured.
+            node* root = holder_.right.load(std::memory_order_acquire);
+            const auto r = attempt_get(&holder_, holder_ovl, root, key);
             if (r == status::retry) continue;
             return r == status::found;
         }
@@ -167,14 +200,9 @@ public:
     // =================================================================
     void insert(Key key, Value value) {
         while (true) {
-            node* root = root_.load(std::memory_order_acquire);
-            if (!root) {
-                if (try_install_root(std::move(key), std::move(value))) return;
-                // Lost the race; retry from root.
-                continue;
-            }
-            const auto r = attempt_insert(/*parent=*/nullptr, /*pv=*/0,
-                                          /*n=*/root, key, value);
+            const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
+            node* root = holder_.right.load(std::memory_order_acquire);
+            const auto r = attempt_insert(&holder_, holder_ovl, root, key, value);
             if (r == status::retry) continue;
             return;
         }
@@ -265,9 +293,14 @@ private:
     // lock acquisition.
     [[nodiscard]] status attempt_insert(node* parent, ovl_t pv, node* n,
                                         const Key& key, Value& value) {
+        // The direction we descended from `parent` to reach `n`. For the
+        // first call from insert() this is dir::right (the holder always
+        // sends us right). For subsequent recursive levels it's recomputed
+        // from key vs parent.key.
+        dir current_dir = dir::right;
         while (true) {
             // Validate the edge that brought us to n.
-            if (parent && parent->changeOVL.load(std::memory_order_acquire) != pv) {
+            if (parent->changeOVL.load(std::memory_order_acquire) != pv) {
                 return status::retry;
             }
             if (!n) {
@@ -278,11 +311,7 @@ private:
                     if (parent->changeOVL.load(std::memory_order_acquire) != pv) {
                         return status::retry;
                     }
-                    // The direction we came from is determined by key
-                    // vs parent.key. The slot must still be null under
-                    // the same OVL (otherwise the OVL would have moved).
-                    const dir d = (key < parent->key) ? dir::left : dir::right;
-                    if (parent->child(d).load(std::memory_order_relaxed) != nullptr) {
+                    if (parent->child(current_dir).load(std::memory_order_relaxed) != nullptr) {
                         return status::retry;
                     }
 
@@ -292,7 +321,7 @@ private:
 
                     auto* fresh = new node{Key{key}, std::move(value)};
                     fresh->parent.store(parent, std::memory_order_release);
-                    parent->child(d).store(fresh, std::memory_order_release);
+                    parent->child(current_dir).store(fresh, std::memory_order_release);
 
                     const ovl_t finished = (pv + detail::cavl::ovl_version_one)
                                          & detail::cavl::ovl_version_mask;
@@ -334,6 +363,7 @@ private:
             parent = n;
             pv = nv;
             n = c;
+            current_dir = d;
         }
     }
 
@@ -359,7 +389,11 @@ private:
     // -----------------------------------------------------------------
     void fix_heights_and_rebalance_ascent(node* start) {
         node* n = start;
-        while (n != nullptr) {
+        // The ascent stops at the holder. The holder is not a real
+        // AVL node — its right subtree IS the entire tree, so its
+        // balance factor is meaningless (always heavily right-skewed).
+        // Rotating "around" the holder would be a category error.
+        while (n != nullptr && n != &holder_) {
             std::int32_t bf = 0;
             {
                 std::scoped_lock nl{n->lock};
@@ -370,12 +404,11 @@ private:
                 const auto hr = height_of(n->right.load(std::memory_order_acquire));
                 n->height.store(1 + std::max(hl, hr), std::memory_order_release);
                 bf = hr - hl;
-            }  // <-- release n's lock before any rotation chain.
+            }
 
             if (bf > 1)        try_right_heavy_rotate(n);
             else if (bf < -1)  try_left_heavy_rotate(n);
 
-            // n's parent may have changed if we just rotated; re-read.
             n = n->parent.load(std::memory_order_acquire);
         }
     }
@@ -387,8 +420,10 @@ private:
     // The "parent-side" lock to use when rotating n. If n.parent is
     // nullptr, n is the real root and we use root_lock_ to synchronise
     // the assignment to root_.
+    // p is always non-null now because the holder sits above every
+    // real node — if n is the actual root, n.parent == &holder_.
     [[nodiscard]] std::mutex& parent_side_lock(node* parent_of_n) noexcept {
-        return parent_of_n ? parent_of_n->lock : root_lock_;
+        return parent_of_n->lock;
     }
 
     // Right-heavy rotation entry. n is right-heavy (bf > 1). Decides
@@ -486,6 +521,11 @@ private:
     void do_rotate_left_under_locks(node* p, node* n, node* y) {
         node* B = y->left.load(std::memory_order_acquire);
 
+        // ALSO mark the parent as in-flux. p's child pointer is about
+        // to change; any reader that captured p.OVL while looking at
+        // its old child must retry. This is especially important when
+        // p is the holder — that's how readers detect "root changed".
+        set_shrinking(p);
         set_shrinking(n);
         set_shrinking(y);
 
@@ -493,20 +533,14 @@ private:
         n->right.store(B, std::memory_order_release);
         if (B) B->parent.store(n, std::memory_order_release);
 
-        // Re-link n's parent (or root_) to point at y.
-        if (p) {
-            if (p->left.load(std::memory_order_acquire) == n) {
-                p->left.store(y, std::memory_order_release);
-            } else {
-                p->right.store(y, std::memory_order_release);
-            }
+        if (p->left.load(std::memory_order_acquire) == n) {
+            p->left.store(y, std::memory_order_release);
         } else {
-            root_.store(y, std::memory_order_release);
+            p->right.store(y, std::memory_order_release);
         }
         y->parent.store(p, std::memory_order_release);
         n->parent.store(y, std::memory_order_release);
 
-        // Heights bottom-up.
         n->height.store(1 + std::max(height_of(n->left.load(std::memory_order_acquire)),
                                      height_of(n->right.load(std::memory_order_acquire))),
                         std::memory_order_release);
@@ -516,12 +550,14 @@ private:
 
         clear_shrinking(n);
         clear_shrinking(y);
+        clear_shrinking(p);
     }
 
     // Mirror of rotate_left.
     void do_rotate_right_under_locks(node* p, node* n, node* y) {
         node* B = y->right.load(std::memory_order_acquire);
 
+        set_shrinking(p);
         set_shrinking(n);
         set_shrinking(y);
 
@@ -529,14 +565,10 @@ private:
         n->left.store(B, std::memory_order_release);
         if (B) B->parent.store(n, std::memory_order_release);
 
-        if (p) {
-            if (p->left.load(std::memory_order_acquire) == n) {
-                p->left.store(y, std::memory_order_release);
-            } else {
-                p->right.store(y, std::memory_order_release);
-            }
+        if (p->left.load(std::memory_order_acquire) == n) {
+            p->left.store(y, std::memory_order_release);
         } else {
-            root_.store(y, std::memory_order_release);
+            p->right.store(y, std::memory_order_release);
         }
         y->parent.store(p, std::memory_order_release);
         n->parent.store(y, std::memory_order_release);
@@ -550,6 +582,7 @@ private:
 
         clear_shrinking(n);
         clear_shrinking(y);
+        clear_shrinking(p);
     }
 
     static void set_shrinking(node* n) noexcept {
@@ -571,14 +604,8 @@ private:
     // Returns true if we won the race, false if we lost it (and the
     // caller should retry the regular insert path).
     // -----------------------------------------------------------------
-    [[nodiscard]] bool try_install_root(Key key, Value value) {
-        std::scoped_lock lk{root_lock_};
-        if (root_.load(std::memory_order_relaxed) != nullptr) return false;
-        auto* fresh = new node{std::move(key), std::move(value)};
-        root_.store(fresh, std::memory_order_release);
-        size_.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
+    // try_install_root removed: the first insert publishes under
+    // holder_ via the regular attempt_insert path.
 
     // -----------------------------------------------------------------
     // Destructor helper. Single-threaded post-conditions assumed.
