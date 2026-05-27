@@ -1,50 +1,61 @@
-# FlowShield - DDoS Detection Engine
-# Built on ParallelAVL
+# FlowShield Build System — C++23
+# Built on the C++23 header-only ParallelAVL core.
 #
-# Build Options:
-#   make          - Standard demo (rule-based detection)
-#   make ai       - AI/ML anomaly detection (CPU)
-#   make hailo    - Hailo-8L acceleration (Raspberry Pi 5)
-#   make pcap     - Live capture with libpcap
-#   make full     - All features enabled
+# Targets:
+#   make            - Standard demo (rule-based detection)
+#   make ai         - AI/ML anomaly detection (CPU)
+#   make hailo      - Hailo-8L acceleration (Raspberry Pi 5)
+#   make pcap       - Live capture with libpcap
+#   make full       - All features enabled
+#   make unified    - APT + network unified demo
+#   make rpi        - Raspberry Pi 5 optimized build
 
-CC = gcc
-CFLAGS = -Wall -Wextra -O3 -std=c11 -pthread -D_GNU_SOURCE
-CFLAGS += -I../include -Iinclude
-LDFLAGS = -pthread -lm
+CXX = g++
+
+CXXSTD = -std=c++23
+CXXFLAGS = $(CXXSTD) -Wall -Wextra -O3 -pthread -Wno-interference-size
+CXXFLAGS += -I../include -Iinclude
+LDFLAGS = -pthread
 
 # Platform-specific optimizations
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),aarch64)
-    # Raspberry Pi / ARM64
-    CFLAGS += -mcpu=native
+    CXXFLAGS += -mcpu=native
 else
-    # x86_64
-    CFLAGS += -march=native
+    CXXFLAGS += -march=native
 endif
 
 # Debug build
-DEBUG_CFLAGS = -Wall -Wextra -g -O0 -std=c11 -pthread -DDEBUG -D_GNU_SOURCE
-DEBUG_CFLAGS += -I../include -Iinclude
+DEBUG_CXXFLAGS = $(CXXSTD) -Wall -Wextra -g -O0 -pthread -DDEBUG -Wno-interference-size
+DEBUG_CXXFLAGS += -I../include -Iinclude
 
 # Feature flags
-PCAP_CFLAGS = -DHAVE_PCAP
-PCAP_LDFLAGS = -lpcap
+PCAP_CXXFLAGS = -DHAVE_PCAP
+PCAP_LDFLAGS  = -lpcap
 
-AI_CFLAGS = -DHAVE_AI
-AI_SRCS = src/ai_inference.c
+AI_CXXFLAGS = -DHAVE_AI
+AI_SRCS     = src/ai_inference.cpp
 
-HAILO_CFLAGS = -DHAVE_HAILO -DHAVE_AI
-HAILO_LDFLAGS = -lhailort
+HAILO_CXXFLAGS = -DHAVE_HAILO -DHAVE_AI
+HAILO_LDFLAGS  = -lhailort
 
-# Source files
-PARALLEL_AVL_SRCS = ../src/parallel_avl.c ../src/avl_tree.c ../src/shard.c \
-                    ../src/router.c ../src/redirect_index.c ../src/hash_table.c
-FLOWSHIELD_SRCS = src/flow_tracker.c src/anomaly_detector.c src/flowshield.c
-PCAP_SRCS = src/pcap_capture.c
+# FlowShield sources (always linked)
+FLOWSHIELD_SRCS = \
+    src/flow_tracker.cpp \
+    src/anomaly_detector.cpp \
+    src/flowshield.cpp \
+    src/ai_inference.cpp \
+    src/provenance_graph.cpp \
+    src/gnn_gat.cpp \
+    src/temporal_gnn.cpp \
+    src/causal_inference.cpp \
+    src/apt_detector.cpp \
+    src/unified_detector.cpp
 
-# Targets
-.PHONY: all clean demo debug test ai hailo pcap full check-pcap check-hailo help rpi
+PCAP_SRCS = src/pcap_capture.cpp
+
+.PHONY: all clean demo debug test ai hailo pcap full unified \
+        check-pcap check-hailo help rpi
 
 all: demo
 
@@ -54,13 +65,11 @@ all: demo
 
 demo: bin/conference_demo
 
-bin/conference_demo: demo/conference_demo.c $(FLOWSHIELD_SRCS) $(PARALLEL_AVL_SRCS)
+bin/conference_demo: demo/conference_demo.cpp $(FLOWSHIELD_SRCS)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/conference_demo"
-	@echo "   Run: ./bin/conference_demo 2  (hotspot attack)"
-	@echo ""
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: bin/conference_demo"
+	@echo "   Run: ./bin/conference_demo 2"
 
 # ============================================================================
 # AI/ML Builds
@@ -68,13 +77,10 @@ bin/conference_demo: demo/conference_demo.c $(FLOWSHIELD_SRCS) $(PARALLEL_AVL_SR
 
 ai: bin/ai_demo
 
-bin/ai_demo: demo/ai_demo.c $(FLOWSHIELD_SRCS) $(AI_SRCS) $(PARALLEL_AVL_SRCS)
+bin/ai_demo: demo/ai_demo.cpp $(FLOWSHIELD_SRCS)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(AI_CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/ai_demo (CPU inference)"
-	@echo "   Run: ./bin/ai_demo"
-	@echo ""
+	$(CXX) $(CXXFLAGS) $(AI_CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: bin/ai_demo (CPU inference)"
 
 # Hailo-8L accelerated build (Raspberry Pi 5)
 hailo: check-hailo bin/ai_demo_hailo
@@ -82,20 +88,27 @@ hailo: check-hailo bin/ai_demo_hailo
 check-hailo:
 	@echo "Checking for Hailo runtime..."
 	@if [ -f /usr/lib/libhailort.so ] || [ -f /usr/lib/aarch64-linux-gnu/libhailort.so ]; then \
-		echo "✓ HailoRT found"; \
+		echo "HailoRT found"; \
 	else \
-		echo "⚠️  HailoRT not found. Install from: https://hailo.ai/developer-zone/"; \
-		echo "   Falling back to CPU inference..."; \
+		echo "HailoRT not found. Falling back to CPU inference..."; \
 	fi
 
-bin/ai_demo_hailo: demo/ai_demo.c $(FLOWSHIELD_SRCS) $(AI_SRCS) $(PARALLEL_AVL_SRCS)
+bin/ai_demo_hailo: demo/ai_demo.cpp $(FLOWSHIELD_SRCS)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(HAILO_CFLAGS) -o $@ $^ $(LDFLAGS) $(HAILO_LDFLAGS) 2>/dev/null || \
-		$(CC) $(CFLAGS) $(AI_CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/ai_demo_hailo"
-	@echo "   Run: ./bin/ai_demo_hailo"
-	@echo ""
+	$(CXX) $(CXXFLAGS) $(HAILO_CXXFLAGS) -o $@ $^ $(LDFLAGS) $(HAILO_LDFLAGS) 2>/dev/null || \
+		$(CXX) $(CXXFLAGS) $(AI_CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: bin/ai_demo_hailo"
+
+# ============================================================================
+# Unified APT detection demo
+# ============================================================================
+
+unified: bin/unified_apt_demo
+
+bin/unified_apt_demo: demo/unified_apt_detection_demo.cpp $(FLOWSHIELD_SRCS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: bin/unified_apt_demo"
 
 # ============================================================================
 # Live Capture Builds
@@ -106,56 +119,51 @@ pcap: check-pcap bin/flowshield_live
 check-pcap:
 	@echo "Checking for libpcap..."
 	@pkg-config --exists libpcap 2>/dev/null || \
-		(echo "❌ libpcap not found. Install: sudo apt-get install libpcap-dev" && exit 1)
-	@echo "✓ libpcap found"
+		(echo "libpcap not found. Install: sudo apt-get install libpcap-dev" && exit 1)
+	@echo "libpcap found"
 
-bin/flowshield_live: demo/live_capture.c $(FLOWSHIELD_SRCS) $(PCAP_SRCS) $(PARALLEL_AVL_SRCS)
+bin/flowshield_live: demo/live_capture.cpp $(FLOWSHIELD_SRCS) $(PCAP_SRCS)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(PCAP_CFLAGS) -o $@ $^ $(LDFLAGS) $(PCAP_LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/flowshield_live"
+	$(CXX) $(CXXFLAGS) $(PCAP_CXXFLAGS) -o $@ $^ $(LDFLAGS) $(PCAP_LDFLAGS)
+	@echo "Built: bin/flowshield_live"
 	@echo "   Run: sudo ./bin/flowshield_live eth0"
-	@echo ""
 
 # Full build with AI + pcap
 full: bin/flowshield_full
 
-bin/flowshield_full: demo/live_capture.c $(FLOWSHIELD_SRCS) $(AI_SRCS) $(PCAP_SRCS) $(PARALLEL_AVL_SRCS)
+bin/flowshield_full: demo/live_capture.cpp $(FLOWSHIELD_SRCS) $(PCAP_SRCS)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(AI_CFLAGS) $(PCAP_CFLAGS) -o $@ $^ $(LDFLAGS) $(PCAP_LDFLAGS) 2>/dev/null || \
-		$(CC) $(CFLAGS) $(PCAP_CFLAGS) -o $@ demo/live_capture.c $(FLOWSHIELD_SRCS) $(PCAP_SRCS) $(PARALLEL_AVL_SRCS) $(LDFLAGS) $(PCAP_LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/flowshield_full (AI + pcap)"
-	@echo ""
+	$(CXX) $(CXXFLAGS) $(AI_CXXFLAGS) $(PCAP_CXXFLAGS) -o $@ $^ $(LDFLAGS) $(PCAP_LDFLAGS) 2>/dev/null || \
+		$(CXX) $(CXXFLAGS) $(PCAP_CXXFLAGS) -o $@ \
+		    demo/live_capture.cpp $(FLOWSHIELD_SRCS) $(PCAP_SRCS) $(LDFLAGS) $(PCAP_LDFLAGS)
+	@echo "Built: bin/flowshield_full (AI + pcap)"
 
 # ============================================================================
-# Raspberry Pi 5 Optimized Build
+# Raspberry Pi 5 optimized
 # ============================================================================
 
 rpi: rpi-check bin/flowshield_rpi
 
 rpi-check:
-	@echo "🍓 Building for Raspberry Pi 5..."
+	@echo "Building for Raspberry Pi 5..."
 	@if [ "$(UNAME_M)" != "aarch64" ]; then \
-		echo "⚠️  Warning: Not running on ARM64. Cross-compiling..."; \
+		echo "Warning: not running on ARM64. Cross-compiling..."; \
 	fi
 
-bin/flowshield_rpi: demo/ai_demo.c $(FLOWSHIELD_SRCS) $(AI_SRCS) $(PARALLEL_AVL_SRCS)
+bin/flowshield_rpi: demo/ai_demo.cpp $(FLOWSHIELD_SRCS)
 	@mkdir -p bin
-	$(CC) -Wall -Wextra -O3 -mcpu=cortex-a76 -std=c11 -pthread -D_GNU_SOURCE \
-		-I../include -Iinclude $(AI_CFLAGS) \
+	$(CXX) -Wall -Wextra -O3 -mcpu=cortex-a76 $(CXXSTD) -pthread \
+		-Wno-interference-size -I../include -Iinclude $(AI_CXXFLAGS) \
 		-o $@ $^ $(LDFLAGS)
-	@echo ""
-	@echo "✅ Built: bin/flowshield_rpi (optimized for Cortex-A76)"
-	@echo ""
+	@echo "Built: bin/flowshield_rpi (Cortex-A76)"
 
 # ============================================================================
-# Test & Run
+# Debug / test / run
 # ============================================================================
 
-debug: CFLAGS = $(DEBUG_CFLAGS)
+debug: CXXFLAGS = $(DEBUG_CXXFLAGS)
 debug: bin/conference_demo
-	@echo "🐛 Debug build complete"
+	@echo "Debug build complete"
 
 test: bin/conference_demo
 	@echo "Running hotspot attack demo..."
@@ -165,67 +173,25 @@ test-ai: bin/ai_demo
 	@echo "Running AI demo..."
 	./bin/ai_demo
 
-test-all: bin/conference_demo
-	./bin/conference_demo all
+test-unified: bin/unified_apt_demo
+	./bin/unified_apt_demo
 
 run: bin/conference_demo
 	./bin/conference_demo all
 
-live: bin/conference_demo
-	./bin/conference_demo 4
-
-# ============================================================================
-# Clean
-# ============================================================================
-
 clean:
 	rm -rf bin/
 	rm -f src/*.o
-	@echo "🧹 Cleaned"
-
-# ============================================================================
-# Help
-# ============================================================================
+	@echo "Cleaned"
 
 help:
-	@echo ""
-	@echo "╔══════════════════════════════════════════════════════════════════╗"
-	@echo "║              FlowShield Build System                              ║"
-	@echo "║                                                                   ║"
-	@echo "║  DDoS Detection with ParallelAVL + Optional AI Acceleration      ║"
-	@echo "╚══════════════════════════════════════════════════════════════════╝"
-	@echo ""
-	@echo "Build Targets:"
-	@echo "  make              Standard demo (rule-based detection)"
-	@echo "  make ai           AI/ML anomaly detection (CPU)"
-	@echo "  make hailo        Hailo-8L acceleration (RPi 5)"
-	@echo "  make pcap         Live capture with libpcap"
-	@echo "  make full         All features (AI + pcap)"
-	@echo "  make rpi          Raspberry Pi 5 optimized build"
-	@echo "  make debug        Debug symbols enabled"
-	@echo "  make clean        Remove build artifacts"
-	@echo ""
-	@echo "Test Targets:"
-	@echo "  make test         Hotspot attack demo"
-	@echo "  make test-ai      AI inference demo"
-	@echo "  make test-all     All demos"
-	@echo ""
-	@echo "Demo Commands:"
-	@echo "  ./bin/conference_demo 1       Normal traffic"
-	@echo "  ./bin/conference_demo 2       Hotspot attack"
-	@echo "  ./bin/conference_demo 3       Detection algorithms"
-	@echo "  ./bin/conference_demo 4       Live dashboard"
-	@echo ""
-	@echo "AI Demo Commands:"
-	@echo "  ./bin/ai_demo platform        Hardware detection"
-	@echo "  ./bin/ai_demo features        Feature extraction"
-	@echo "  ./bin/ai_demo anomaly         Autoencoder demo"
-	@echo "  ./bin/ai_demo integration     Full integration"
-	@echo ""
-	@echo "Live Capture (requires root):"
-	@echo "  sudo ./bin/flowshield_live eth0"
-	@echo "  sudo ./bin/flowshield_live -f capture.pcap"
-	@echo ""
-	@echo "Raspberry Pi 5 with Hailo-8L:"
-	@echo "  make hailo && ./bin/ai_demo_hailo"
-	@echo ""
+	@echo "FlowShield Build System (C++23)"
+	@echo "  make / make demo    Build conference demo (rule-based)"
+	@echo "  make ai             AI/ML anomaly detection demo"
+	@echo "  make hailo          Hailo-8L acceleration (RPi 5)"
+	@echo "  make pcap           Live capture with libpcap"
+	@echo "  make full           Live capture + AI"
+	@echo "  make unified        Unified APT + network demo"
+	@echo "  make rpi            Raspberry Pi 5 optimized build"
+	@echo "  make debug          Debug symbols + sanitizers"
+	@echo "  make clean          Remove artifacts"
