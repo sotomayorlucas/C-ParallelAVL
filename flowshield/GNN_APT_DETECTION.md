@@ -42,7 +42,7 @@ proceso_A --fork--> proceso_B --write--> archivo_C --read--> proceso_D --connect
 
 ## Key Components
 
-### Provenance Graph (`provenance_graph.h/c`)
+### Provenance Graph (`provenance_graph.hpp/c`)
 
 **Scalability optimizations:**
 - Hash table for O(1) node lookups (up to 1M nodes)
@@ -70,7 +70,7 @@ typedef struct ProvenanceEdge {
 } ProvenanceEdge;
 ```
 
-### GNN/GAT Model (`gnn_gat.h/c`)
+### GNN/GAT Model (`gnn_gat.hpp/c`)
 
 **Architecture:**
 ```
@@ -106,7 +106,7 @@ int gnn_predict_graph(GNNModel* model, ProvenanceGraph* graph, float* out_probs)
 size_t gnn_predict_nodes(GNNModel* model, ProvenanceGraph* graph, float* out_scores);
 ```
 
-### APT Detector (`apt_detector.h`)
+### APT Detector (`apt_detector.hpp`)
 
 **Features:**
 - **Multi-phase detection**: Reconnaissance, Exploitation, C2, Exfiltration, etc.
@@ -191,7 +191,7 @@ void gnn_compute_causal_weights(ProvenanceGraph* graph, GNNModel* model,
 ## Usage Example
 
 ```c
-#include "flowshield/include/apt_detector.h"
+#include "flowshield/include/apt_detector.hpp"
 
 // 1. Create APT detector
 APTDetector* detector = apt_detector_create(
@@ -280,12 +280,12 @@ Host Layer (GNN/GAT)       → Detect APT chains, privilege escalation
 ```
 flowshield/
 ├── include/
-│   ├── provenance_graph.h    # Provenance graph structures
-│   ├── gnn_gat.h              # GNN/GAT model
-│   └── apt_detector.h         # APT detection engine
+│   ├── provenance_graph.hpp    # Provenance graph structures
+│   ├── gnn_gat.hpp              # GNN/GAT model
+│   └── apt_detector.hpp         # APT detection engine
 ├── src/
-│   ├── provenance_graph.c     # Graph implementation
-│   └── gnn_gat.c              # GNN/GAT implementation
+│   ├── provenance_graph.cpp     # Graph implementation
+│   └── gnn_gat.cpp              # GNN/GAT implementation
 └── GNN_APT_DETECTION.md       # This file
 ```
 
