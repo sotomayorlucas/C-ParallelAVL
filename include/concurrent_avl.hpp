@@ -90,18 +90,19 @@ private:
         std::atomic<node*> left{nullptr};
         std::atomic<node*> right{nullptr};
 
-        // Parent only used by writers (rotations, eventually). For
-        // Fase 1a it's just informational — readers don't follow it.
-        node* parent{nullptr};
+        // Atomic because the rebalance ascent reads it without locks
+        // (only writes parent under SELF's lock during rotation).
+        std::atomic<node*> parent{nullptr};
 
-        // Used by Fase 1b for AVL balance. Initialised to 1 (leaf).
-        std::int32_t height{1};
+        // AVL height. Read lock-free by rebalance, written under
+        // SELF's lock.
+        std::atomic<std::int32_t> height{1};
 
         // The protocol's heart. See cavl::ovl_* helpers.
         std::atomic<ovl_t> changeOVL{0};
 
-        // Per-node writer lock. Held only on the parent during insert,
-        // and (in later phases) on the nodes involved in a rotation.
+        // Per-node writer lock. Held during insert's child publish,
+        // and during rotation on every node whose pointers change.
         std::mutex lock;
 
         template <typename K, typename V>
@@ -172,7 +173,8 @@ public:
                 // Lost the race; retry from root.
                 continue;
             }
-            const auto r = attempt_insert(root, key, value);
+            const auto r = attempt_insert(/*parent=*/nullptr, /*pv=*/0,
+                                          /*n=*/root, key, value);
             if (r == status::retry) continue;
             return;
         }
@@ -200,65 +202,50 @@ private:
     //   n      : the node we are currently visiting
     //   key    : search key
     // -----------------------------------------------------------------
+    // Iterative Bronson descent with parent-OVL validation.
+    //
+    // Invariant at the top of each iteration: we reached `n` by reading
+    // parent.child(d) and parent's OVL was `pv` at that read. Before
+    // doing anything with `n`, we re-read parent.OVL and check it's
+    // still `pv`. If it changed, the path is no longer valid (parent
+    // rotated, possibly moving `n` to a different subtree) — restart
+    // from root.
+    //
+    // For the first call from contains(), parent is nullptr; the check
+    // is skipped at the entry.
     [[nodiscard]] status attempt_get(node* parent, ovl_t pv, node* n, const Key& key) const {
         while (true) {
-            // 1. Read this node's version up-front. We'll re-check it
-            //    later to validate the child we follow.
-            const ovl_t nv = n->changeOVL.load(std::memory_order_acquire);
-            if (detail::cavl::ovl_is_unlinked(nv)) {
-                // Someone unlinked us mid-traversal. Bail to outer retry.
+            // Validate the (parent -> n) edge before we touch n.
+            if (parent && parent->changeOVL.load(std::memory_order_acquire) != pv) {
                 return status::retry;
             }
-            // If a write is in progress on n we don't know whether the
-            // child slot we want is stable. Wait briefly and retry.
-            if (detail::cavl::ovl_is_changing(nv)) {
-                std::this_thread::yield();
-                continue;
+            if (!n) {
+                // Empty slot reached through a still-valid parent edge.
+                return status::not_found;
             }
 
-            // 2. Compare and decide direction.
+            const ovl_t nv = n->changeOVL.load(std::memory_order_acquire);
+            if (detail::cavl::ovl_is_unlinked(nv)) return status::retry;
+            if (detail::cavl::ovl_is_changing(nv)) {
+                std::this_thread::yield();
+                continue;  // re-validate parent edge and re-read n.OVL
+            }
+
             if (!(key < n->key) && !(n->key < key)) {
-                // Key match. The match itself doesn't depend on
-                // pointer state — n->key is immutable after
-                // construction — so we can return without rechecking
-                // versions. (Validation of the value's presence
-                // becomes relevant in Fase 2 for partially-external
-                // routing nodes.)
                 return status::found;
             }
             const dir d = (key < n->key) ? dir::left : dir::right;
 
-            // 3. Follow the child link. Re-validate n's version after
-            //    the load: if it changed, n was modified and the
-            //    child we read may have been a transient value.
             node* c = n->child(d).load(std::memory_order_acquire);
-            const ovl_t nv2 = n->changeOVL.load(std::memory_order_acquire);
-            if (nv2 != nv) {
-                // n changed underneath us — restart at n.
-                continue;
+            // Validate n's OVL after reading its child.
+            if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                return status::retry;
             }
 
-            // 4. If parent != null, also validate that parent hasn't
-            //    rotated us away. We don't actually need to chase
-            //    parents here in Fase 1a (no rotations), but the hook
-            //    is in place so Fase 1b can use it.
-            //    (For now `pv` is informational.)
-            (void)parent; (void)pv;
-
-            if (!c) {
-                // Empty slot — key is absent. But if n's version had
-                // any in-flight modification when we last looked, we
-                // couldn't have gotten here (the changing check above
-                // already deflected us). So this answer is stable.
-                return status::not_found;
-            }
-
-            // 5. Recurse into c. (Tail call effectively.)
-            n = c;
-            parent = n;        // would be `n` from caller's frame, but
-                               // attempt_get is iterative so we just
-                               // advance and reuse the locals.
+            // Descend: n becomes the new parent for the next iteration.
+            parent = n;
             pv = nv;
+            n = c;
         }
     }
 
@@ -270,8 +257,55 @@ private:
     // node. If the key matches mid-descent, overwrites the value
     // under that node's lock.
     // -----------------------------------------------------------------
-    [[nodiscard]] status attempt_insert(node* n, const Key& key, Value& value) {
+    // Bronson insert descent. Mirrors attempt_get's parent-OVL
+    // validation: every edge we follow is validated before we trust
+    // the child. The publish step takes the parent's lock and
+    // re-validates parent.OVL against the captured nv2 once more,
+    // to catch a rotation that happened between the descent and the
+    // lock acquisition.
+    [[nodiscard]] status attempt_insert(node* parent, ovl_t pv, node* n,
+                                        const Key& key, Value& value) {
         while (true) {
+            // Validate the edge that brought us to n.
+            if (parent && parent->changeOVL.load(std::memory_order_acquire) != pv) {
+                return status::retry;
+            }
+            if (!n) {
+                // Slot empty along a still-valid parent edge: publish.
+                node* parent_of_fresh = nullptr;
+                {
+                    std::scoped_lock lk{parent->lock};
+                    if (parent->changeOVL.load(std::memory_order_acquire) != pv) {
+                        return status::retry;
+                    }
+                    // The direction we came from is determined by key
+                    // vs parent.key. The slot must still be null under
+                    // the same OVL (otherwise the OVL would have moved).
+                    const dir d = (key < parent->key) ? dir::left : dir::right;
+                    if (parent->child(d).load(std::memory_order_relaxed) != nullptr) {
+                        return status::retry;
+                    }
+
+                    const ovl_t bumped = (pv & detail::cavl::ovl_version_mask)
+                                       | detail::cavl::ovl_growing_bit;
+                    parent->changeOVL.store(bumped, std::memory_order_release);
+
+                    auto* fresh = new node{Key{key}, std::move(value)};
+                    fresh->parent.store(parent, std::memory_order_release);
+                    parent->child(d).store(fresh, std::memory_order_release);
+
+                    const ovl_t finished = (pv + detail::cavl::ovl_version_one)
+                                         & detail::cavl::ovl_version_mask;
+                    parent->changeOVL.store(finished, std::memory_order_release);
+
+                    size_.fetch_add(1, std::memory_order_relaxed);
+                    parent_of_fresh = parent;
+                }  // <-- parent->lock released BEFORE ascent.
+
+                fix_heights_and_rebalance_ascent(parent_of_fresh);
+                return status::inserted;
+            }
+
             const ovl_t nv = n->changeOVL.load(std::memory_order_acquire);
             if (detail::cavl::ovl_is_unlinked(nv)) return status::retry;
             if (detail::cavl::ovl_is_changing(nv)) {
@@ -280,10 +314,10 @@ private:
             }
 
             if (!(key < n->key) && !(n->key < key)) {
-                // Key match — update value under n's lock.
+                // Key match — overwrite under n's lock. Validate n's
+                // OVL after taking the lock.
                 std::scoped_lock lk{n->lock};
-                // Validate that n is still alive after taking the lock.
-                if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+                if (n->changeOVL.load(std::memory_order_acquire) != nv) {
                     return status::retry;
                 }
                 n->value = std::move(value);
@@ -292,45 +326,244 @@ private:
 
             const dir d = (key < n->key) ? dir::left : dir::right;
             node* c = n->child(d).load(std::memory_order_acquire);
-            const ovl_t nv2 = n->changeOVL.load(std::memory_order_acquire);
-            if (nv2 != nv) continue;  // n moved underneath us, retry at n
-
-            if (c) {
-                n = c;
-                continue;
-            }
-
-            // Slot is empty — try to install a new child here. Take
-            // n's lock and re-check the slot.
-            std::scoped_lock lk{n->lock};
-            if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+            if (n->changeOVL.load(std::memory_order_acquire) != nv) {
                 return status::retry;
             }
-            if (n->child(d).load(std::memory_order_relaxed) != nullptr) {
-                // Someone else inserted into the same slot first. The
-                // child must be re-descended into.
-                continue;
-            }
 
-            // Mark n as growing so concurrent readers know to wait
-            // before trusting the new child link.
-            const ovl_t bumped = (nv2 & detail::cavl::ovl_version_mask)
-                               | detail::cavl::ovl_growing_bit;
-            n->changeOVL.store(bumped, std::memory_order_release);
-
-            auto* fresh = new node{std::move(key), std::move(value)};
-            fresh->parent = n;
-            n->child(d).store(fresh, std::memory_order_release);
-
-            // Clear growing, bump version. Readers that saw growing
-            // will retry and now see the new child.
-            const ovl_t finished = (nv2 + detail::cavl::ovl_version_one)
-                                 & detail::cavl::ovl_version_mask;
-            n->changeOVL.store(finished, std::memory_order_release);
-
-            size_.fetch_add(1, std::memory_order_relaxed);
-            return status::inserted;
+            // Descend.
+            parent = n;
+            pv = nv;
+            n = c;
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Rebalance ascent with single + double rotations.
+    //
+    // For each node along the path from `start` to the root:
+    //   1. Take SELF's lock briefly. Recompute height. Read balance.
+    //      Release lock.
+    //   2. If |balance| > 1, decide single vs double rotation.
+    //      Acquire ALL needed locks atomically via std::lock (p, n,
+    //      y, and z for double rotations), validate post-lock, then
+    //      do the pointer surgery + height updates under those locks.
+    //
+    // Lock acquisition discipline:
+    //   - All multi-lock acquisitions use std::lock, which is
+    //     deadlock-free for any order.
+    //   - We never hold n's lock while taking another lock outside of
+    //     std::lock (avoids the cross-rotation deadlock we hit earlier).
+    //   - Self-locking is impossible: we always release SELF's lock
+    //     before the rotation tries to re-acquire it as part of the
+    //     bigger std::lock chain.
+    // -----------------------------------------------------------------
+    void fix_heights_and_rebalance_ascent(node* start) {
+        node* n = start;
+        while (n != nullptr) {
+            std::int32_t bf = 0;
+            {
+                std::scoped_lock nl{n->lock};
+                if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+                    return;
+                }
+                const auto hl = height_of(n->left.load(std::memory_order_acquire));
+                const auto hr = height_of(n->right.load(std::memory_order_acquire));
+                n->height.store(1 + std::max(hl, hr), std::memory_order_release);
+                bf = hr - hl;
+            }  // <-- release n's lock before any rotation chain.
+
+            if (bf > 1)        try_right_heavy_rotate(n);
+            else if (bf < -1)  try_left_heavy_rotate(n);
+
+            // n's parent may have changed if we just rotated; re-read.
+            n = n->parent.load(std::memory_order_acquire);
+        }
+    }
+
+    [[nodiscard]] static std::int32_t height_of(const node* n) noexcept {
+        return n ? n->height.load(std::memory_order_acquire) : 0;
+    }
+
+    // The "parent-side" lock to use when rotating n. If n.parent is
+    // nullptr, n is the real root and we use root_lock_ to synchronise
+    // the assignment to root_.
+    [[nodiscard]] std::mutex& parent_side_lock(node* parent_of_n) noexcept {
+        return parent_of_n ? parent_of_n->lock : root_lock_;
+    }
+
+    // Right-heavy rotation entry. n is right-heavy (bf > 1). Decides
+    // between single rotate_left (RR case) and double rotate_right_then_left
+    // (RL case) based on y = n.right's own balance.
+    void try_right_heavy_rotate(node* n) {
+        node* y = n->right.load(std::memory_order_acquire);
+        if (!y) return;
+        const auto y_hl = height_of(y->left.load(std::memory_order_acquire));
+        const auto y_hr = height_of(y->right.load(std::memory_order_acquire));
+        const bool double_case = (y_hr - y_hl) < 0;
+
+        node* p = n->parent.load(std::memory_order_acquire);
+        std::mutex& p_lock = parent_side_lock(p);
+
+        if (double_case) {
+            node* z = y->left.load(std::memory_order_acquire);
+            if (!z) return;
+            std::lock(p_lock, n->lock, y->lock, z->lock);
+            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> zl{z->lock, std::adopt_lock};
+            if (!validate_rotation(p, n, y, true)) return;
+            if (n->right.load(std::memory_order_acquire) != y) return;
+            if (y->left.load(std::memory_order_acquire) != z)  return;
+            do_rotate_right_under_locks(n, y, z);
+            // After step 1, n's right is z. Step 2: rotate left around n.
+            node* new_y = n->right.load(std::memory_order_acquire);
+            do_rotate_left_under_locks(p, n, new_y);
+        } else {
+            std::lock(p_lock, n->lock, y->lock);
+            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+            if (!validate_rotation(p, n, y, true)) return;
+            do_rotate_left_under_locks(p, n, y);
+        }
+    }
+
+    void try_left_heavy_rotate(node* n) {
+        node* y = n->left.load(std::memory_order_acquire);
+        if (!y) return;
+        const auto y_hl = height_of(y->left.load(std::memory_order_acquire));
+        const auto y_hr = height_of(y->right.load(std::memory_order_acquire));
+        const bool double_case = (y_hl - y_hr) < 0;
+
+        node* p = n->parent.load(std::memory_order_acquire);
+        std::mutex& p_lock = parent_side_lock(p);
+
+        if (double_case) {
+            node* z = y->right.load(std::memory_order_acquire);
+            if (!z) return;
+            std::lock(p_lock, n->lock, y->lock, z->lock);
+            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> zl{z->lock, std::adopt_lock};
+            if (!validate_rotation(p, n, y, false)) return;
+            if (n->left.load(std::memory_order_acquire) != y)   return;
+            if (y->right.load(std::memory_order_acquire) != z)  return;
+            do_rotate_left_under_locks(n, y, z);
+            node* new_y = n->left.load(std::memory_order_acquire);
+            do_rotate_right_under_locks(p, n, new_y);
+        } else {
+            std::lock(p_lock, n->lock, y->lock);
+            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+            if (!validate_rotation(p, n, y, false)) return;
+            do_rotate_right_under_locks(p, n, y);
+        }
+    }
+
+    // Post-lock validation. The triple (p, n, y) must still match the
+    // tree's actual state: p must still be n's parent, y must still be
+    // n's appropriate child.
+    [[nodiscard]] bool validate_rotation(node* p, node* n, node* y, bool right_heavy) const noexcept {
+        if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) return false;
+        if (detail::cavl::ovl_is_unlinked(y->changeOVL.load(std::memory_order_acquire))) return false;
+        if (n->parent.load(std::memory_order_acquire) != p) return false;
+        const node* expected_child = right_heavy ? n->right.load(std::memory_order_acquire)
+                                                 : n->left.load(std::memory_order_acquire);
+        if (expected_child != y) return false;
+        return true;
+    }
+
+    // Single rotate-left under all relevant locks held by caller.
+    //
+    //      n                y
+    //     / \              / \
+    //    A   y     ->     n   C
+    //       / \          / \
+    //      B   C        A   B
+    void do_rotate_left_under_locks(node* p, node* n, node* y) {
+        node* B = y->left.load(std::memory_order_acquire);
+
+        set_shrinking(n);
+        set_shrinking(y);
+
+        y->left.store(n, std::memory_order_release);
+        n->right.store(B, std::memory_order_release);
+        if (B) B->parent.store(n, std::memory_order_release);
+
+        // Re-link n's parent (or root_) to point at y.
+        if (p) {
+            if (p->left.load(std::memory_order_acquire) == n) {
+                p->left.store(y, std::memory_order_release);
+            } else {
+                p->right.store(y, std::memory_order_release);
+            }
+        } else {
+            root_.store(y, std::memory_order_release);
+        }
+        y->parent.store(p, std::memory_order_release);
+        n->parent.store(y, std::memory_order_release);
+
+        // Heights bottom-up.
+        n->height.store(1 + std::max(height_of(n->left.load(std::memory_order_acquire)),
+                                     height_of(n->right.load(std::memory_order_acquire))),
+                        std::memory_order_release);
+        y->height.store(1 + std::max(height_of(y->left.load(std::memory_order_acquire)),
+                                     height_of(y->right.load(std::memory_order_acquire))),
+                        std::memory_order_release);
+
+        clear_shrinking(n);
+        clear_shrinking(y);
+    }
+
+    // Mirror of rotate_left.
+    void do_rotate_right_under_locks(node* p, node* n, node* y) {
+        node* B = y->right.load(std::memory_order_acquire);
+
+        set_shrinking(n);
+        set_shrinking(y);
+
+        y->right.store(n, std::memory_order_release);
+        n->left.store(B, std::memory_order_release);
+        if (B) B->parent.store(n, std::memory_order_release);
+
+        if (p) {
+            if (p->left.load(std::memory_order_acquire) == n) {
+                p->left.store(y, std::memory_order_release);
+            } else {
+                p->right.store(y, std::memory_order_release);
+            }
+        } else {
+            root_.store(y, std::memory_order_release);
+        }
+        y->parent.store(p, std::memory_order_release);
+        n->parent.store(y, std::memory_order_release);
+
+        n->height.store(1 + std::max(height_of(n->left.load(std::memory_order_acquire)),
+                                     height_of(n->right.load(std::memory_order_acquire))),
+                        std::memory_order_release);
+        y->height.store(1 + std::max(height_of(y->left.load(std::memory_order_acquire)),
+                                     height_of(y->right.load(std::memory_order_acquire))),
+                        std::memory_order_release);
+
+        clear_shrinking(n);
+        clear_shrinking(y);
+    }
+
+    static void set_shrinking(node* n) noexcept {
+        const ovl_t cur = n->changeOVL.load(std::memory_order_acquire);
+        n->changeOVL.store((cur & detail::cavl::ovl_version_mask)
+                              | detail::cavl::ovl_shrinking_bit,
+                           std::memory_order_release);
+    }
+    static void clear_shrinking(node* n) noexcept {
+        const ovl_t cur = n->changeOVL.load(std::memory_order_acquire);
+        n->changeOVL.store(((cur & detail::cavl::ovl_version_mask)
+                            + detail::cavl::ovl_version_one)
+                           & detail::cavl::ovl_version_mask,
+                           std::memory_order_release);
     }
 
     // -----------------------------------------------------------------
