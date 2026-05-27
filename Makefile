@@ -1,18 +1,16 @@
-# Makefile for Parallel AVL Tree - Pure C (Optimized)
+# Makefile for Parallel AVL Tree - C++23 (header-only, optimized)
 # Supports Windows (MinGW) and Unix (GCC/Clang)
 
-# Compiler detection
-CC ?= gcc
+CXX ?= g++
 
-# Optimization flags
-CFLAGS_BASE = -std=c11 -Wall -Wextra -pedantic
-CFLAGS_OPT = -O3 -march=native -flto -ffast-math
-CFLAGS_DEBUG = -g -O0 -DDEBUG -fsanitize=address
+# C++23 with cherry-picks from C++26 (gated on feature-test macros in code).
+CXXSTD = -std=c++23
+CXXFLAGS_BASE = $(CXXSTD) -Wall -Wextra -Wpedantic -Wno-interference-size
+CXXFLAGS_OPT  = -O3 -march=native -flto -ffast-math -fno-exceptions -fno-rtti
+CXXFLAGS_DEBUG = -g -O0 -DDEBUG -fsanitize=address,undefined
 
-# Include paths
 INCLUDES = -I include
 
-# Platform detection
 ifeq ($(OS),Windows_NT)
     PLATFORM := windows
     EXE := .exe
@@ -20,114 +18,96 @@ ifeq ($(OS),Windows_NT)
     RM = del /Q /F
     RMDIR = rmdir /S /Q
     MKDIR = mkdir
-    PATHSEP = \\
 else
     PLATFORM := unix
     EXE :=
-    LDFLAGS = -pthread -lm -flto
+    LDFLAGS = -pthread -flto
     RM = rm -f
     RMDIR = rm -rf
     MKDIR = mkdir -p
-    PATHSEP = /
 endif
 
-# Directories
-SRC_DIR = src
-INC_DIR = include
+INC_DIR   = include
 BENCH_DIR = bench
-TEST_DIR = tests
+TEST_DIR  = tests
 BUILD_DIR = build
 
-# Source files
-SRCS = $(SRC_DIR)/avl_tree.c \
-       $(SRC_DIR)/hash_table.c \
-       $(SRC_DIR)/shard.c \
-       $(SRC_DIR)/router.c \
-       $(SRC_DIR)/redirect_index.c \
-       $(SRC_DIR)/parallel_avl.c
+HEADERS = $(INC_DIR)/common.hpp \
+          $(INC_DIR)/avl_tree.hpp \
+          $(INC_DIR)/hash_table.hpp \
+          $(INC_DIR)/shard.hpp \
+          $(INC_DIR)/router.hpp \
+          $(INC_DIR)/redirect_index.hpp \
+          $(INC_DIR)/parallel_avl.hpp
 
-# Object files
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+BENCHMARK     = benchmark_parallel$(EXE)
+TEST          = test_avl$(EXE)
+COMPILER_CMP  = compiler_compare$(EXE)
+STRESS        = stress_test$(EXE)
 
-# Targets
-BENCHMARK = benchmark_parallel$(EXE)
-TEST = test_avl$(EXE)
-LIB = libparallel_avl.a
-
-# Default target
-.PHONY: all clean debug release test benchmark lib help
+.PHONY: all clean debug release test benchmark stress compare help
 
 all: release
 
-release: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_OPT)
-release: $(BUILD_DIR) $(BENCHMARK) $(TEST)
+release: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
+release: $(BENCHMARK) $(TEST)
 
-debug: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_DEBUG)
-debug: LDFLAGS += -fsanitize=address
-debug: $(BUILD_DIR) $(BENCHMARK) $(TEST)
+debug: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_DEBUG)
+debug: LDFLAGS += -fsanitize=address,undefined
+debug: $(BENCHMARK) $(TEST)
 
-# Create build directory
-$(BUILD_DIR):
-ifeq ($(PLATFORM),windows)
-	@if not exist $(BUILD_DIR) $(MKDIR) $(BUILD_DIR)
-else
-	@$(MKDIR) $(BUILD_DIR)
-endif
+$(BENCHMARK): $(BENCH_DIR)/benchmark_parallel.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
-# Object files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(TEST): $(TEST_DIR)/test_avl.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
-# Static library
-lib: $(BUILD_DIR) $(OBJS)
-	ar rcs $(BUILD_DIR)/$(LIB) $(OBJS)
+$(COMPILER_CMP): $(BENCH_DIR)/compiler_compare.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
-# Benchmark executable
-$(BENCHMARK): $(OBJS) $(BENCH_DIR)/benchmark_parallel.c
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(BENCH_DIR)/benchmark_parallel.c $(OBJS) $(LDFLAGS)
+$(STRESS): $(BENCH_DIR)/stress_test.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
-# Test executable
-$(TEST): $(OBJS) $(TEST_DIR)/test_avl.c
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(TEST_DIR)/test_avl.c $(OBJS) $(LDFLAGS)
-
-# Run targets
+benchmark: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
 benchmark: $(BENCHMARK)
 	./$(BENCHMARK)
 
+test: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
 test: $(TEST)
 	./$(TEST)
 
-# Clean
+stress: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
+stress: $(STRESS)
+	./$(STRESS)
+
+compare: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
+compare: $(COMPILER_CMP)
+	./$(COMPILER_CMP)
+
 clean:
 ifeq ($(PLATFORM),windows)
 	@if exist $(BUILD_DIR) $(RMDIR) $(BUILD_DIR)
 	@if exist $(BENCHMARK) $(RM) $(BENCHMARK)
 	@if exist $(TEST) $(RM) $(TEST)
+	@if exist $(COMPILER_CMP) $(RM) $(COMPILER_CMP)
+	@if exist $(STRESS) $(RM) $(STRESS)
 else
 	$(RMDIR) $(BUILD_DIR)
-	$(RM) $(BENCHMARK) $(TEST)
+	$(RM) $(BENCHMARK) $(TEST) $(COMPILER_CMP) $(STRESS)
 endif
 
-# Help
 help:
-	@echo "Parallel AVL Tree - Pure C (Optimized)"
+	@echo "Parallel AVL Tree - C++23 (header-only, optimized)"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make / make release - Build optimized binaries"
-	@echo "  make debug          - Build with debug symbols and sanitizers"
-	@echo "  make lib            - Build static library"
-	@echo "  make test           - Build and run tests"
+	@echo "  make / make release - Build benchmark + tests (optimized)"
+	@echo "  make debug          - Build with ASan + UBSan"
+	@echo "  make test           - Build and run unit tests"
 	@echo "  make benchmark      - Build and run benchmark"
+	@echo "  make stress         - Build and run stress test"
+	@echo "  make compare        - Build and run compiler comparison"
 	@echo "  make clean          - Remove build artifacts"
 	@echo ""
-	@echo "Compiler: $(CC)"
+	@echo "Compiler: $(CXX)"
+	@echo "Standard: $(CXXSTD)"
 	@echo "Platform: $(PLATFORM)"
-	@echo "Flags:    $(CFLAGS_BASE) $(CFLAGS_OPT)"
-
-# Dependencies
-$(BUILD_DIR)/avl_tree.o: $(SRC_DIR)/avl_tree.c $(INC_DIR)/avl_tree.h
-$(BUILD_DIR)/hash_table.o: $(SRC_DIR)/hash_table.c $(INC_DIR)/hash_table.h
-$(BUILD_DIR)/shard.o: $(SRC_DIR)/shard.c $(INC_DIR)/shard.h $(INC_DIR)/avl_tree.h $(INC_DIR)/atomics.h
-$(BUILD_DIR)/router.o: $(SRC_DIR)/router.c $(INC_DIR)/router.h $(INC_DIR)/atomics.h
-$(BUILD_DIR)/redirect_index.o: $(SRC_DIR)/redirect_index.c $(INC_DIR)/redirect_index.h $(INC_DIR)/hash_table.h $(INC_DIR)/atomics.h
-$(BUILD_DIR)/parallel_avl.o: $(SRC_DIR)/parallel_avl.c $(INC_DIR)/parallel_avl.h $(INC_DIR)/shard.h $(INC_DIR)/router.h $(INC_DIR)/redirect_index.h
