@@ -213,12 +213,23 @@ Multi-thread sustained (8 threads, 4M ops, 70/15/15 read/insert/delete):
 ~2.7 M ops/s for both — within noise.
 
 Topology safety overhead: the hand-rolled reader gate
-(`active_readers_` + `scaling_wanted_`) measures ~15% faster on a
-read-only microbench than `std::shared_mutex` would (4.3 vs 3.75 M
-ops/s, 8 threads, 20M total ops). Versus an unsynchronised read it
-still costs ~20%. That overhead buys correctness: the original C
-version use-after-free'd under concurrent scaling, confirmed by
-AddressSanitizer.
+(`active_readers_` + `scaling_wanted_`, seq_cst on the Dekker legs)
+runs roughly on par with `std::shared_mutex` — measured 3.89 vs 3.75 M
+ops/s (8 threads, 20M total ops, 5-run average; well inside noise).
+That tells us libstdc++'s pthread_rwlock_t was already close to
+optimal for this workload, and the remaining read-only cost vs an
+unsynchronised baseline is dominated by the per-shard `std::mutex`,
+not by the topology gate.
+
+The hand-rolled gate is still worth it: it makes the protocol explicit
+in our own header (so we can audit memory ordering directly), and an
+earlier draft using acquire/relaxed shipped a Dekker-style ordering
+bug that TSan didn't catch under the single counter — promoting to
+seq_cst on the synchronizing legs closes it. See the protocol comment
+in `parallel_avl.hpp` for details.
+
+That overhead buys correctness: the original C version use-after-free'd
+under concurrent scaling, confirmed by AddressSanitizer.
 
 ## License
 

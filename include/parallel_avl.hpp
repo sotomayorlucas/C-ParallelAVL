@@ -378,15 +378,25 @@ private:
     // counter is the same idea but avoids the pthread_rwlock_t machinery
     // libstdc++ uses underneath shared_mutex.
     //
-    // Protocol:
-    //   reader::enter  ->  fetch_add(active_readers_, acquire)
-    //                      if scaling_wanted_ != 0  rollback + block
+    // Protocol (Dekker's mutual exclusion — both legs must be seq_cst):
+    //   reader::enter  ->  fetch_add(active_readers_, seq_cst)
+    //                      if load(scaling_wanted_, seq_cst) != 0
+    //                          rollback + park on scaling_mutex_
     //   reader::exit   ->  fetch_sub(active_readers_, release)
     //   writer::enter  ->  scaling_mutex_.lock()                     // serialize writers
-    //                      scaling_wanted_.store(1, release)         // block new readers
-    //                      spin/yield until active_readers_ == 0     // drain
-    //   writer::exit   ->  scaling_wanted_.store(0, release)
-    //                      scaling_mutex_.unlock()                   // unblock readers
+    //                      store(scaling_wanted_, 1, seq_cst)        // block new readers
+    //                      spin/yield until load(active_readers_, seq_cst) == 0
+    //   writer::exit   ->  store(scaling_wanted_, 0, release)
+    //                      scaling_mutex_.unlock()                   // unblock parked readers
+    //
+    // The seq_cst on the reader fetch_add / writer store is what closes
+    // the Dekker hole — an earlier version used acquire/relaxed there
+    // and worked accidentally because the cache-line traffic on the
+    // single counter serialized things; a striped-counter variant of
+    // that pattern blew up under TSan. On x86_64 the only extra cost is
+    // one mfence on the writer store (rare path); reader fetch_add and
+    // load(seq_cst) lower to the same lock xadd / mov as their
+    // acquire/relaxed counterparts.
     //
     // Padded to its own cache line to keep the writer's flag away from
     // unrelated atomics (size_/router stats).
@@ -399,8 +409,8 @@ private:
     public:
         PAVL_ALWAYS_INLINE explicit read_guard(const parallel_avl* t) noexcept : t_{t} {
             while (true) {
-                t_->active_readers_.fetch_add(1, std::memory_order_acquire);
-                if (t_->scaling_wanted_.load(std::memory_order_relaxed) == 0) [[likely]] return;
+                t_->active_readers_.fetch_add(1, std::memory_order_seq_cst);
+                if (t_->scaling_wanted_.load(std::memory_order_seq_cst) == 0) [[likely]] return;
                 t_->active_readers_.fetch_sub(1, std::memory_order_release);
                 // A writer wants to scale. Park on scaling_mutex_ — it
                 // is held by the writer for the duration of the mutation.
@@ -420,10 +430,10 @@ private:
     public:
         explicit write_guard(parallel_avl* t) : t_{t} {
             t_->scaling_mutex_.lock();
-            t_->scaling_wanted_.store(1, std::memory_order_release);
+            t_->scaling_wanted_.store(1, std::memory_order_seq_cst);
             // Drain in-flight readers. After this loop returns we know
             // no thread is observing the *current* shards_raw_/router_raw_.
-            while (t_->active_readers_.load(std::memory_order_acquire) > 0) {
+            while (t_->active_readers_.load(std::memory_order_seq_cst) > 0) {
                 std::this_thread::yield();
             }
         }
