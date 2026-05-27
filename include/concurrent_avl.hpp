@@ -111,6 +111,14 @@ private:
         // the next operation that traverses the area.
         std::atomic<bool> needs_rebalance{false};
 
+        // Bronson's "partially-external" deletion mark. A node with
+        // two children that's logically removed stays in the tree as
+        // a routing-only node (key preserved for BST descent, value
+        // absent). Lookups that land on a routing node return not
+        // found; inserts that match a routing node's key REACTIVATE
+        // it instead of allocating a new node.
+        std::atomic<bool> is_routing{false};
+
         // Per-node writer lock. Held during insert's child publish,
         // and during rotation on every node whose pointers change.
         std::mutex lock;
@@ -217,13 +225,35 @@ public:
         }
     }
 
+    // Logically remove `key` from the tree. Returns true if a live
+    // node was found and turned into a routing node (or unlinked, in
+    // the 0/1-child case once Fase 2b lands). Returns false if the
+    // key was already absent or already routing.
+    //
+    // Fase 2a: marks the matched node as routing (is_routing = true)
+    // and decrements size. The node stays in the BST structure so
+    // future inserts of the same key can reactivate it cheaply.
+    // Fase 2b will add the physical unlink path for nodes with 0/1
+    // children, restoring O(log n) memory.
+    bool remove(const Key& key) {
+        while (true) {
+            const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
+            node* root = holder_.right.load(std::memory_order_acquire);
+            const auto r = attempt_remove(&holder_, holder_ovl, root, key);
+            if (r == status::retry) continue;
+            return r == status::removed;
+        }
+    }
+
 private:
     // attempt_get / attempt_insert return one of these.
     //   found      — for contains: key present
     //   not_found  — for contains: key absent, descent ended at a null slot
     //   inserted   — for insert: a new node was created (or value overwritten)
     //   retry      — the descent observed inconsistency; restart from root
-    enum class status : std::uint8_t { found, not_found, inserted, retry };
+    enum class status : std::uint8_t {
+        found, not_found, inserted, removed, retry
+    };
 
     // -----------------------------------------------------------------
     // Lookup descent (recursive — depth bounded by tree height, which
@@ -269,6 +299,17 @@ private:
             }
 
             if (!(key < n->key) && !(n->key < key)) {
+                // Match on the node's key. If it has been logically
+                // removed (routing node), the key is absent from the
+                // tree's value-set even though the node is still in
+                // the structure. is_routing is monotonic within a
+                // node's life — once set, it stays set until an
+                // insert reactivates it under n's lock — so an
+                // acquire-load here pairs with the release-store in
+                // remove() / the reactivation store in attempt_insert.
+                if (n->is_routing.load(std::memory_order_acquire)) {
+                    return status::not_found;
+                }
                 return status::found;
             }
             const dir d = (key < n->key) ? dir::left : dir::right;
@@ -352,13 +393,23 @@ private:
             }
 
             if (!(key < n->key) && !(n->key < key)) {
-                // Key match — overwrite under n's lock. Validate n's
-                // OVL after taking the lock.
+                // Key match. Two sub-cases:
+                //   (a) n is a routing node (logically removed by a
+                //       prior remove()): REACTIVATE it. Set the new
+                //       value, clear is_routing, bump size, return
+                //       inserted (logically a new key in the set).
+                //   (b) n is live: overwrite the value, no size change,
+                //       return inserted (Bronson's status code; from
+                //       the user's point of view "already present").
                 std::scoped_lock lk{n->lock};
                 if (n->changeOVL.load(std::memory_order_acquire) != nv) {
                     return status::retry;
                 }
                 n->value = std::move(value);
+                if (n->is_routing.load(std::memory_order_acquire)) {
+                    n->is_routing.store(false, std::memory_order_release);
+                    size_.fetch_add(1, std::memory_order_relaxed);
+                }
                 return status::inserted;
             }
 
@@ -387,6 +438,65 @@ private:
             pv = nv;
             n = c;
             current_dir = d;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Logical remove (Fase 2a).
+    //
+    // Same Bronson-style validating descent as attempt_get; when it
+    // reaches the matching node, takes that node's lock and marks
+    // it as routing (is_routing = true). If the node was already
+    // routing or absent, returns not_found.
+    //
+    // Fase 2b will add the physical unlink path: when the routing
+    // node has 0 or 1 children, it can be unlinked from the tree
+    // (under parent + node + maybe-child locks) and recycled later
+    // via EBR. For now everything stays in the tree; concurrent
+    // re-insert of the same key reactivates the routing node
+    // cheaply (see attempt_insert).
+    // -----------------------------------------------------------------
+    [[nodiscard]] status attempt_remove(node* parent, ovl_t pv, node* n,
+                                        const Key& key) {
+        while (true) {
+            if (parent->changeOVL.load(std::memory_order_acquire) != pv) {
+                return status::retry;
+            }
+            if (!n) return status::not_found;
+
+            const ovl_t nv = n->changeOVL.load(std::memory_order_acquire);
+            if (detail::cavl::ovl_is_unlinked(nv)) return status::retry;
+            if (detail::cavl::ovl_is_changing(nv)) {
+                std::this_thread::yield();
+                continue;
+            }
+
+            if (!(key < n->key) && !(n->key < key)) {
+                // Matched n's key. Take n's lock and atomically:
+                //   - check that n's OVL is still nv (no rotation
+                //     touched n between our descent and the lock);
+                //   - check that n isn't already routing (a concurrent
+                //     remove may have already turned it).
+                std::scoped_lock lk{n->lock};
+                if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                    return status::retry;
+                }
+                if (n->is_routing.load(std::memory_order_relaxed)) {
+                    return status::not_found;       // already removed
+                }
+                n->is_routing.store(true, std::memory_order_release);
+                size_.fetch_sub(1, std::memory_order_relaxed);
+                return status::removed;
+            }
+
+            const dir d = (key < n->key) ? dir::left : dir::right;
+            node* c = n->child(d).load(std::memory_order_acquire);
+            if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                return status::retry;
+            }
+            parent = n;
+            pv = nv;
+            n = c;
         }
     }
 

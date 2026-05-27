@@ -247,6 +247,103 @@ void test_avl_balance_random() {
     for (i64 i = 0; i < 5000; ++i) EXPECT(t.contains(i));
 }
 
+// =====================================================================
+// Fase 2a: remove() with logical (routing) deletion.
+// =====================================================================
+void test_remove_basic() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(10, 100);
+    t.insert(20, 200);
+    EXPECT(t.size() == 2);
+    EXPECT(t.contains(10));
+    EXPECT(t.remove(10));
+    EXPECT(!t.contains(10));
+    EXPECT(t.size() == 1);
+}
+
+void test_remove_absent() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(10, 100);
+    EXPECT(!t.remove(99));        // never inserted
+    EXPECT(t.contains(10));
+    EXPECT(t.size() == 1);
+    EXPECT(t.remove(10));
+    EXPECT(!t.remove(10));        // already routing
+}
+
+void test_remove_reactivation() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(42, 100);
+    EXPECT(t.remove(42));
+    EXPECT(!t.contains(42));
+    EXPECT(t.size() == 0);
+    t.insert(42, 200);            // reactivates the routing node
+    EXPECT(t.contains(42));
+    EXPECT(t.size() == 1);
+}
+
+void test_remove_many() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 200; ++i) t.insert(i, i * 10);
+    EXPECT(t.size() == 200);
+    for (int i = 0; i < 200; i += 2) EXPECT(t.remove(i));
+    EXPECT(t.size() == 100);
+    for (int i = 0; i < 200; ++i) {
+        if (i % 2 == 0) EXPECT(!t.contains(i));
+        else            EXPECT(t.contains(i));
+    }
+}
+
+void test_concurrent_remove() {
+    pavl::concurrent_avl<i64, i64> t;
+    constexpr int N = 1000;
+    for (int i = 0; i < N; ++i) t.insert(i, i);
+    EXPECT(t.size() == N);
+
+    constexpr int NT = 8;
+    {
+        std::vector<std::jthread> ws;
+        for (int tid = 0; tid < NT; ++tid) {
+            ws.emplace_back([&, tid] {
+                // Each thread removes a disjoint slice.
+                const int chunk = N / NT;
+                const int lo = tid * chunk;
+                const int hi = (tid == NT - 1) ? N : lo + chunk;
+                for (int i = lo; i < hi; ++i) (void)t.remove(i);
+            });
+        }
+    }
+    EXPECT(t.size() == 0);
+    for (int i = 0; i < N; ++i) EXPECT(!t.contains(i));
+}
+
+void test_concurrent_insert_remove_mix() {
+    pavl::concurrent_avl<i64, i64> t;
+    constexpr int NT = 8;
+    constexpr int OPS = 1000;
+    // Half threads insert into [0, 500), half remove from [0, 500).
+    {
+        std::vector<std::jthread> ws;
+        for (int tid = 0; tid < NT; ++tid) {
+            ws.emplace_back([&, tid] {
+                std::mt19937_64 rng(tid * 31u + 11u);
+                std::uniform_int_distribution<i64> d(0, 499);
+                for (int i = 0; i < OPS; ++i) {
+                    const auto k = d(rng);
+                    if (tid < NT / 2) t.insert(k, 0);
+                    else              (void)t.remove(k);
+                }
+            });
+        }
+    }
+    // No correctness predicate beyond "didn't crash, size matches
+    // contains count" — under random mixed ops we can't predict the
+    // final state.
+    std::size_t found = 0;
+    for (int k = 0; k < 500; ++k) if (t.contains(k)) ++found;
+    EXPECT(found == t.size());
+}
+
 void test_avl_balance_concurrent() {
     pavl::concurrent_avl<i64, i64> t;
     constexpr int NT = 8;
@@ -316,6 +413,14 @@ int main() {
     RUN(avl_balance_descending);
     RUN(avl_balance_random);
     RUN(avl_balance_concurrent);
+
+    std::cout << "\n=== concurrent_avl Fase 2a — remove ===\n";
+    RUN(remove_basic);
+    RUN(remove_absent);
+    RUN(remove_reactivation);
+    RUN(remove_many);
+    RUN(concurrent_remove);
+    RUN(concurrent_insert_remove_mix);
 
     std::cout << std::format("\n=== Results ===\nPassed: {}\nFailed: {}\n",
                              tests_passed, tests_failed);
