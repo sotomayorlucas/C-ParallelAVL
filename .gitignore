@@ -1,4 +1,5 @@
 build/
+flowshield/bin/
 *.o
 *.a
 benchmark_parallel
