@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -31,15 +32,36 @@ public:
         std::int32_t _pad;
     };
 
+    // Returned by try_insert / insert_or_assign / try_emplace.
+    struct insert_result {
+        Value* value_ptr;    // pointer to the stored value (existing or new)
+        bool   inserted;     // true if a new node was created
+    };
+
 private:
     static constexpr std::size_t pool_block_size = 256;
 
+    // The pool keeps a single linked list of free slots through raw bytes:
+    // each freed slot's first sizeof(void*) bytes hold a pointer to the next
+    // free slot. Slots are constructed (placement-new) on acquire and
+    // destroyed (std::destroy_at) on release, so the byte-pointer trick only
+    // ever runs over storage that is NOT alive as a `node`. This avoids the
+    // lifetime UB of writing through a non-constructed union member.
     struct node_block {
-        union storage { node n; constexpr storage() noexcept {} ~storage() noexcept {} };
-        storage slots[pool_block_size];
-        node_block* next;
-        node_block() noexcept : next{nullptr} {}
+        alignas(node) std::byte data[sizeof(node) * pool_block_size];
+        node_block* next{nullptr};
     };
+
+    static constexpr std::size_t slot_stride = sizeof(node);
+
+    [[nodiscard]] static std::byte* slot_at(node_block* b, std::size_t i) noexcept {
+        return b->data + i * slot_stride;
+    }
+
+    [[nodiscard]] static std::byte* free_list_link(std::byte* slot) noexcept {
+        // The first sizeof(void*) bytes of a free slot store the next pointer.
+        return slot;
+    }
 
     class node_pool {
     public:
@@ -61,31 +83,43 @@ private:
         }
         ~node_pool() noexcept { release_blocks(); }
 
-        [[nodiscard]] PAVL_ALWAYS_INLINE node* acquire_raw() {
+        // Returns raw storage for one node. The caller must construct
+        // key/value/etc with std::construct_at (or assignment for trivial
+        // types) before reading any field.
+        [[nodiscard]] PAVL_ALWAYS_INLINE std::byte* acquire_raw_storage() {
             if (free_list_) [[likely]] {
-                node* n = free_list_;
-                free_list_ = n->right;
-                return n;
+                std::byte* slot = free_list_;
+                std::byte* next;
+                std::memcpy(&next, free_list_link(slot), sizeof(next));
+                free_list_ = next;
+                return slot;
             }
             auto* block = new (std::nothrow) node_block{};
             if (!block) [[unlikely]] return nullptr;
             block->next = blocks_;
             blocks_ = block;
+            // Build the free list: slots [1..N-1] form the new free list,
+            // slot 0 will be handed back to the caller. All writes go to
+            // raw bytes — no node has begun its lifetime yet.
             for (std::size_t i = 1; i < pool_block_size - 1; ++i) {
-                auto* nd = std::launder(reinterpret_cast<node*>(&block->slots[i]));
-                auto* nx = std::launder(reinterpret_cast<node*>(&block->slots[i + 1]));
-                nd->right = nx;
+                std::byte* cur  = slot_at(block, i);
+                std::byte* next = slot_at(block, i + 1);
+                std::memcpy(free_list_link(cur), &next, sizeof(next));
             }
-            auto* last = std::launder(reinterpret_cast<node*>(&block->slots[pool_block_size - 1]));
-            last->right = free_list_;
-            free_list_ = std::launder(reinterpret_cast<node*>(&block->slots[1]));
+            std::byte* last = slot_at(block, pool_block_size - 1);
+            std::memcpy(free_list_link(last), &free_list_, sizeof(free_list_));
+            free_list_ = slot_at(block, 1);
             total_ += pool_block_size;
-            return std::launder(reinterpret_cast<node*>(&block->slots[0]));
+            return slot_at(block, 0);
         }
 
-        PAVL_ALWAYS_INLINE void release_raw(node* n) noexcept {
-            n->right = free_list_;
-            free_list_ = n;
+        // Returns a previously-acquired (and now destroyed) slot to the
+        // free list. The caller is responsible for std::destroy_at-ing the
+        // node before calling this — after that the storage is raw bytes
+        // and we can freely write the free-list link.
+        PAVL_ALWAYS_INLINE void release_raw_storage(std::byte* slot) noexcept {
+            std::memcpy(free_list_link(slot), &free_list_, sizeof(free_list_));
+            free_list_ = slot;
         }
 
         void release_blocks() noexcept {
@@ -104,7 +138,7 @@ private:
 
     private:
         node_block* blocks_{};
-        node* free_list_{};
+        std::byte*  free_list_{};
         std::size_t total_{};
     };
 
@@ -138,38 +172,55 @@ public:
         size_ = 0;
     }
 
+    // insert(): always present after the call; overwrites if the key existed.
     PAVL_HOT void insert(Key key, Value value) {
-        node* parent = nullptr;
-        node* current = root_;
-        while (current) [[likely]] {
-            parent = current;
-            if (key < current->key) current = current->left;
-            else if (current->key < key) current = current->right;
-            else {
-                current->value = std::move(value);
-                return;
-            }
-        }
-        node* nn = pool_.acquire_raw();
-        if (!nn) [[unlikely]] return;
-        std::construct_at(&nn->key, key);
-        std::construct_at(&nn->value, std::move(value));
-        nn->left = nullptr;
-        nn->right = nullptr;
-        nn->parent = parent;
-        nn->height = 1;
-        if (!parent) {
-            root_ = nn;
-        } else if (key < parent->key) {
-            parent->left = nn;
-        } else {
-            parent->right = nn;
-        }
-        ++size_;
-        rebalance_from(nn);
+        (void)insert_or_assign(std::move(key), std::move(value));
     }
 
-    PAVL_HOT bool remove(const Key& key) {
+    // insert_or_assign(): tells the caller whether it was a new insertion
+    // or an overwrite. Returns a pointer to the stored value.
+    insert_result insert_or_assign(Key key, Value value) {
+        const auto loc = locate(key);
+        if (loc.found) {
+            loc.found->value = std::move(value);
+            return {&loc.found->value, false};
+        }
+        node* nn = construct_node(std::move(key), std::move(value), loc.parent);
+        if (!nn) [[unlikely]] return {nullptr, false};
+        link_new(nn, loc.parent, loc.attach_to_left);
+        return {&nn->value, true};
+    }
+
+    // try_insert(): no-op if the key already exists.
+    insert_result try_insert(Key key, Value value) {
+        const auto loc = locate(key);
+        if (loc.found) {
+            return {&loc.found->value, false};
+        }
+        node* nn = construct_node(std::move(key), std::move(value), loc.parent);
+        if (!nn) [[unlikely]] return {nullptr, false};
+        link_new(nn, loc.parent, loc.attach_to_left);
+        return {&nn->value, true};
+    }
+
+    // try_emplace(): construct Value in place from args if key absent.
+    template <typename... Args>
+    insert_result try_emplace(Key key, Args&&... args) {
+        const auto loc = locate(key);
+        if (loc.found) {
+            return {&loc.found->value, false};
+        }
+        node* nn = construct_node(std::move(key), std::forward<Args>(args)...);
+        if (!nn) [[unlikely]] return {nullptr, false};
+        nn->parent = loc.parent;
+        link_new(nn, loc.parent, loc.attach_to_left);
+        return {&nn->value, true};
+    }
+
+    // Heterogeneous remove: any K' that is order-comparable with Key.
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    PAVL_HOT bool remove(const K& key) {
         node* n = find_node(root_, key);
         if (!n) return false;
         node* rebalance_start = nullptr;
@@ -191,24 +242,28 @@ public:
             succ->left = n->left;
             succ->left->parent = succ;
         }
-        std::destroy_at(&n->value);
-        std::destroy_at(&n->key);
-        pool_.release_raw(n);
+        destroy_node(n);
         --size_;
         if (rebalance_start) rebalance_from(rebalance_start);
         return true;
     }
 
-    [[nodiscard]] PAVL_HOT bool contains(const Key& key) const noexcept {
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] PAVL_HOT bool contains(const K& key) const noexcept {
         return find_node(root_, key) != nullptr;
     }
 
-    [[nodiscard]] PAVL_HOT Value* find(const Key& key) noexcept {
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] PAVL_HOT Value* find(const K& key) noexcept {
         node* n = find_node(root_, key);
         return n ? &n->value : nullptr;
     }
 
-    [[nodiscard]] PAVL_HOT const Value* find(const Key& key) const noexcept {
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] PAVL_HOT const Value* find(const K& key) const noexcept {
         const node* n = find_node(root_, key);
         return n ? &n->value : nullptr;
     }
@@ -255,7 +310,9 @@ private:
         return height_of(n->right) - height_of(n->left);
     }
 
-    [[nodiscard]] PAVL_HOT static node* find_node(node* root, const Key& key) noexcept {
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] PAVL_HOT static node* find_node(node* root, const K& key) noexcept {
         node* cur = root;
         while (cur) [[likely]] {
             PAVL_PREFETCH(cur->left);
@@ -267,7 +324,9 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] PAVL_HOT static const node* find_node(const node* root, const Key& key) noexcept {
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] PAVL_HOT static const node* find_node(const node* root, const K& key) noexcept {
         const node* cur = root;
         while (cur) [[likely]] {
             if (key < cur->key) cur = cur->left;
@@ -275,6 +334,48 @@ private:
             else return cur;
         }
         return nullptr;
+    }
+
+    // Locate where a key would be inserted. If found, returns the existing
+    // node and ignores attach_to_left. If not found, returns the parent
+    // under which the new node should be linked, and which side.
+    struct locate_result {
+        node* found;           // nullptr if absent
+        node* parent;          // parent of the slot where it would go
+        bool  attach_to_left;  // valid only when found == nullptr
+    };
+
+    template <typename K>
+        requires order_comparable_with<Key, K>
+    [[nodiscard]] locate_result locate(const K& key) {
+        node* parent = nullptr;
+        node* cur = root_;
+        bool left = false;
+        while (cur) {
+            if (key < cur->key) {
+                parent = cur; cur = cur->left;  left = true;
+            } else if (cur->key < key) {
+                parent = cur; cur = cur->right; left = false;
+            } else {
+                return {cur, parent, false};
+            }
+        }
+        return {nullptr, parent, left};
+    }
+
+    // Link a freshly-constructed node into the tree under `parent`,
+    // rebalancing on the way up.
+    void link_new(node* nn, node* parent, bool attach_to_left) noexcept {
+        nn->parent = parent;
+        if (!parent) {
+            root_ = nn;
+        } else if (attach_to_left) {
+            parent->left = nn;
+        } else {
+            parent->right = nn;
+        }
+        ++size_;
+        rebalance_from(nn);
     }
 
     [[nodiscard]] static node* leftmost(node* n) noexcept {
@@ -362,8 +463,51 @@ private:
         if (!n) return;
         destroy_subtree(n->left);
         destroy_subtree(n->right);
+        // Subtree destruction does NOT recycle slots back to the pool —
+        // the caller (clear() / dtor) releases the whole block list right
+        // after this returns. Destroying subobjects is enough to run user
+        // destructors; the raw storage goes away with the block.
         std::destroy_at(&n->value);
         std::destroy_at(&n->key);
+    }
+
+    // Acquire raw storage from the pool and begin lifetimes of the node
+    // subobjects. Returns nullptr if the pool can't grow.
+    template <typename K, typename... ValueArgs>
+    [[nodiscard]] node* construct_node(K&& k, ValueArgs&&... value_args)
+        noexcept(std::is_nothrow_constructible_v<Key, K&&>
+              && std::is_nothrow_constructible_v<Value, ValueArgs&&...>)
+    {
+        std::byte* storage = pool_.acquire_raw_storage();
+        if (!storage) [[unlikely]] return nullptr;
+        node* n = std::launder(reinterpret_cast<node*>(storage));
+        std::construct_at(&n->key,   std::forward<K>(k));
+        std::construct_at(&n->value, std::forward<ValueArgs>(value_args)...);
+        n->left = nullptr;
+        n->right = nullptr;
+        n->parent = nullptr;
+        n->height = 1;
+        return n;
+    }
+
+    // Variant that also stores the parent pointer (avoids one extra write
+    // at the caller). Used on the insert() hot path.
+    template <typename K, typename V>
+    [[nodiscard]] node* construct_node(K&& k, V&& v, node* parent)
+        noexcept(std::is_nothrow_constructible_v<Key, K&&>
+              && std::is_nothrow_constructible_v<Value, V&&>)
+    {
+        node* n = construct_node(std::forward<K>(k), std::forward<V>(v));
+        if (n) n->parent = parent;
+        return n;
+    }
+
+    // End lifetimes of the node subobjects and return the raw storage to
+    // the pool. The slot becomes available for the next acquire.
+    PAVL_ALWAYS_INLINE void destroy_node(node* n) noexcept {
+        std::destroy_at(&n->value);
+        std::destroy_at(&n->key);
+        pool_.release_raw_storage(reinterpret_cast<std::byte*>(n));
     }
 
     template <typename F>

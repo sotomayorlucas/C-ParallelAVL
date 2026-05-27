@@ -73,23 +73,65 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
 
+    struct insert_outcome { bool inserted; };
+
     PAVL_HOT void insert(const Key& key, Value value) {
+        (void)insert_or_assign(key, std::move(value));
+    }
+
+    // try_insert: no-op if the key is already present anywhere in the tree.
+    insert_outcome try_insert(const Key& key, Value value) {
         std::shared_lock topo_lock{topology_mutex_};
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
         const auto target = router_raw_->route(h);
-        auto* shard = shards_raw_[target];
-        const auto old_size = shard->size();
-        shard->insert(key, std::move(value));
-        const auto new_size = shard->size();
-        if (new_size > old_size) {
+        const auto r = shards_raw_[target]->try_insert(key, std::move(value));
+        if (r.inserted) {
             router_raw_->record_insertion(target);
             if (target != natural) [[unlikely]] {
                 redirect_index_.record(key, natural, target);
                 has_redirects_.store(true, std::memory_order_release);
             }
         }
+        return {r.inserted};
+    }
+
+    // insert_or_assign: overwrites existing value, reports if it was new.
+    insert_outcome insert_or_assign(const Key& key, Value value) {
+        std::shared_lock topo_lock{topology_mutex_};
+        total_ops_.fetch_add(1, std::memory_order_relaxed);
+        const auto h = key_hash(key);
+        const auto natural = static_cast<std::size_t>(h) % num_shards_;
+        const auto target = router_raw_->route(h);
+        const auto r = shards_raw_[target]->insert_or_assign(key, std::move(value));
+        if (r.inserted) {
+            router_raw_->record_insertion(target);
+            if (target != natural) [[unlikely]] {
+                redirect_index_.record(key, natural, target);
+                has_redirects_.store(true, std::memory_order_release);
+            }
+        }
+        return {r.inserted};
+    }
+
+    // try_emplace: construct Value in-place if the key is absent.
+    template <typename... Args>
+    insert_outcome try_emplace(const Key& key, Args&&... args) {
+        std::shared_lock topo_lock{topology_mutex_};
+        total_ops_.fetch_add(1, std::memory_order_relaxed);
+        const auto h = key_hash(key);
+        const auto natural = static_cast<std::size_t>(h) % num_shards_;
+        const auto target = router_raw_->route(h);
+        const auto r = shards_raw_[target]->try_emplace(key, std::forward<Args>(args)...);
+        if (r.inserted) {
+            router_raw_->record_insertion(target);
+            if (target != natural) [[unlikely]] {
+                redirect_index_.record(key, natural, target);
+                has_redirects_.store(true, std::memory_order_release);
+            }
+        }
+        return {r.inserted};
     }
 
     [[nodiscard]] PAVL_HOT bool contains(const Key& key) {

@@ -32,6 +32,15 @@ concept avl_key = std::totally_ordered<K> && std::copyable<K>;
 template <typename V>
 concept avl_value = std::movable<V>;
 
+// Heterogeneous comparator: any pair (Key, OtherKey) that admits both
+// `key < other` and `other < key`. Mirrors std::set's transparent lookup
+// requirement without forcing the user to opt into std::three_way_comparable.
+template <typename L, typename R>
+concept order_comparable_with = requires(const L& l, const R& r) {
+    { l < r } -> std::convertible_to<bool>;
+    { r < l } -> std::convertible_to<bool>;
+};
+
 template <typename K>
 concept hashable_key = avl_key<K> && requires(K k) {
     { static_cast<std::uint64_t>(k) } -> std::convertible_to<std::uint64_t>;

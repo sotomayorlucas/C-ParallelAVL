@@ -33,16 +33,53 @@ public:
     shard& operator=(shard&&) = delete;
     ~shard() = default;
 
+    // shard's insert_result intentionally omits the value pointer: outside
+    // of the shard mutex a concurrent remove could invalidate it. For
+    // post-insert access use visit(key, lambda).
+    struct insert_outcome { bool inserted; };
+
     PAVL_HOT void insert(Key key, Value value) {
         std::scoped_lock lock{mutex_};
-        const auto old_size = tree_.size();
-        tree_.insert(key, std::move(value));
-        const auto new_size = tree_.size();
-        if (new_size > old_size) {
+        const auto r = tree_.insert_or_assign(key, std::move(value));
+        if (r.inserted) {
             size_.fetch_add(1, std::memory_order_relaxed);
             update_bounds(key);
         }
         insert_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    insert_outcome try_insert(Key key, Value value) {
+        std::scoped_lock lock{mutex_};
+        const auto r = tree_.try_insert(key, std::move(value));
+        if (r.inserted) {
+            size_.fetch_add(1, std::memory_order_relaxed);
+            update_bounds(key);
+        }
+        insert_count_.fetch_add(1, std::memory_order_relaxed);
+        return {r.inserted};
+    }
+
+    insert_outcome insert_or_assign(Key key, Value value) {
+        std::scoped_lock lock{mutex_};
+        const auto r = tree_.insert_or_assign(key, std::move(value));
+        if (r.inserted) {
+            size_.fetch_add(1, std::memory_order_relaxed);
+            update_bounds(key);
+        }
+        insert_count_.fetch_add(1, std::memory_order_relaxed);
+        return {r.inserted};
+    }
+
+    template <typename... Args>
+    insert_outcome try_emplace(Key key, Args&&... args) {
+        std::scoped_lock lock{mutex_};
+        const auto r = tree_.try_emplace(key, std::forward<Args>(args)...);
+        if (r.inserted) {
+            size_.fetch_add(1, std::memory_order_relaxed);
+            update_bounds(key);
+        }
+        insert_count_.fetch_add(1, std::memory_order_relaxed);
+        return {r.inserted};
     }
 
     bool remove(const Key& key) {

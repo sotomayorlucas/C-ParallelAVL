@@ -117,6 +117,56 @@ void test_avl_destructible_value() {
     EXPECT(t.size() == 0);
 }
 
+void test_avl_try_insert() {
+    pavl::avl_tree<i64, i64> t;
+    auto r1 = t.try_insert(10, 100);
+    EXPECT(r1.inserted && r1.value_ptr && *r1.value_ptr == 100);
+    auto r2 = t.try_insert(10, 999);                 // already there → no-op
+    EXPECT(!r2.inserted && r2.value_ptr && *r2.value_ptr == 100);
+    EXPECT(t.size() == 1);
+}
+
+void test_avl_insert_or_assign() {
+    pavl::avl_tree<i64, i64> t;
+    auto r1 = t.insert_or_assign(10, 100);
+    EXPECT(r1.inserted && *r1.value_ptr == 100);
+    auto r2 = t.insert_or_assign(10, 200);           // overwrite
+    EXPECT(!r2.inserted && *r2.value_ptr == 200);
+    EXPECT(t.size() == 1);
+}
+
+void test_avl_try_emplace() {
+    pavl::avl_tree<i64, std::string> t;
+    auto r1 = t.try_emplace(7, 5, 'x');              // "xxxxx"
+    EXPECT(r1.inserted && *r1.value_ptr == "xxxxx");
+    auto r2 = t.try_emplace(7, "ignored");           // already there → no-op
+    EXPECT(!r2.inserted && *r2.value_ptr == "xxxxx");
+}
+
+void test_avl_heterogeneous_lookup_int_short() {
+    pavl::avl_tree<i64, i64> t;
+    t.insert(42, 4200);
+    short s = 42;
+    EXPECT(t.contains(s));
+    auto* v = t.find(s);
+    EXPECT(v && *v == 4200);
+    EXPECT(t.remove(s));
+    EXPECT(t.size() == 0);
+}
+
+void test_avl_heterogeneous_lookup_sv_string() {
+    pavl::avl_tree<std::string, int> t;
+    t.insert("hello", 1);
+    t.insert("world", 2);
+    // string_view does not construct a std::string here:
+    std::string_view sv = "hello";
+    EXPECT(t.contains(sv));
+    auto* v = t.find(sv);
+    EXPECT(v && *v == 1);
+    EXPECT(t.remove(std::string_view{"world"}));
+    EXPECT(t.size() == 1);
+}
+
 // ===========================================================================
 // hash_table tests
 // ===========================================================================
@@ -261,6 +311,30 @@ void test_parallel_large_scale() {
     }
 }
 
+void test_parallel_try_insert() {
+    pavl::parallel_avl<i64, i64> t{4, pavl::router_strategy::static_hash};
+    EXPECT(t.try_insert(7, 70).inserted);
+    EXPECT(!t.try_insert(7, 999).inserted);
+    auto v = t.get(7);
+    EXPECT(v && *v == 70);
+}
+
+void test_parallel_insert_or_assign() {
+    pavl::parallel_avl<i64, i64> t{4, pavl::router_strategy::static_hash};
+    EXPECT(t.insert_or_assign(7, 70).inserted);
+    EXPECT(!t.insert_or_assign(7, 700).inserted);
+    auto v = t.get(7);
+    EXPECT(v && *v == 700);
+}
+
+void test_parallel_try_emplace() {
+    pavl::parallel_avl<i64, std::string> t{4, pavl::router_strategy::static_hash};
+    EXPECT(t.try_emplace(1, 4, 'a').inserted);             // "aaaa"
+    EXPECT(!t.try_emplace(1, "ignored").inserted);
+    auto v = t.get(1);
+    EXPECT(v && *v == "aaaa");
+}
+
 void test_parallel_visit() {
     pavl::parallel_avl<i64, i64> t{4, pavl::router_strategy::intelligent};
     for (int i = 0; i < 100; ++i) t.insert(i, i);
@@ -283,6 +357,11 @@ int main() {
     RUN(avl_balance);
     RUN(avl_node_pool);
     RUN(avl_destructible_value);
+    RUN(avl_try_insert);
+    RUN(avl_insert_or_assign);
+    RUN(avl_try_emplace);
+    RUN(avl_heterogeneous_lookup_int_short);
+    RUN(avl_heterogeneous_lookup_sv_string);
 
     std::cout << "\n=== Hash Table Unit Tests ===\n";
     RUN(hash_create_destroy);
@@ -302,6 +381,9 @@ int main() {
     RUN(parallel_force_rebalance);
     RUN(parallel_routing_strategies);
     RUN(parallel_large_scale);
+    RUN(parallel_try_insert);
+    RUN(parallel_insert_or_assign);
+    RUN(parallel_try_emplace);
     RUN(parallel_visit);
 
     std::cout << std::format("\n=== Results ===\nPassed: {}\nFailed: {}\n",

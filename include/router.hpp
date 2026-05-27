@@ -172,7 +172,8 @@ private:
             ops_since_cache_.store(0, std::memory_order_relaxed);
             update_stats_cache();
         }
-        if (cached_has_hotspot_.load(std::memory_order_relaxed) || cached_balance_score_ < 0.9) {
+        if (cached_has_hotspot_.load(std::memory_order_relaxed)
+            || cached_balance_score_.load(std::memory_order_relaxed) < 0.9) {
             return route_load_aware(natural);
         }
         return natural;
@@ -189,7 +190,7 @@ private:
         const double avg = static_cast<double>(total) / static_cast<double>(num_shards_);
         const double balance = avg > 0 ? std::max(0.0, 1.0 - static_cast<double>(mx - mn) / (2.0 * avg)) : 1.0;
         const bool hotspot = static_cast<double>(mx) > hotspot_threshold * avg;
-        cached_balance_score_ = balance;
+        cached_balance_score_.store(balance, std::memory_order_relaxed);
         cached_has_hotspot_.store(hotspot, std::memory_order_relaxed);
         std::size_t new_interval;
         if (hotspot || balance < 0.8) new_interval = min_cache_interval;
@@ -216,7 +217,11 @@ private:
     std::atomic<std::size_t> ops_since_cache_{0};
     std::atomic<bool> cached_has_hotspot_{false};
     std::atomic<std::size_t> adaptive_interval_{min_cache_interval};
-    double cached_balance_score_{1.0};
+    // Approximate balance metric. Lock-free atomic<double> on x86_64 / ARMv8
+    // — same cost as a plain double load, plus TSan can reason about it.
+    std::atomic<double> cached_balance_score_{1.0};
+    static_assert(std::atomic<double>::is_always_lock_free,
+                  "atomic<double> must be lock-free for the intelligent router fast path");
 
     std::atomic<std::size_t> suspicious_patterns_{0};
     std::atomic<std::size_t> blocked_redirects_{0};
