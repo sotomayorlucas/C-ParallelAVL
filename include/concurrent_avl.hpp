@@ -102,6 +102,15 @@ private:
         // The protocol's heart. See cavl::ovl_* helpers.
         std::atomic<ovl_t> changeOVL{0};
 
+        // Pending-rebalance flag. Set by an ascent that detected an
+        // imbalance on this node but couldn't apply the rotation
+        // (validation lost the race with another ascent). Cleared by
+        // the next operation that successfully rebalances this node.
+        // Concurrent inserts pick up pendings on descent (see
+        // attempt_insert) so off-path imbalances don't linger past
+        // the next operation that traverses the area.
+        std::atomic<bool> needs_rebalance{false};
+
         // Per-node writer lock. Held during insert's child publish,
         // and during rotation on every node whose pointers change.
         std::mutex lock;
@@ -359,6 +368,20 @@ private:
                 return status::retry;
             }
 
+            // Opportunistic pending-rebalance pickup. If n has been
+            // flagged by a prior ascent that couldn't finish its
+            // rotation, process it before continuing the descent.
+            // The flag and the processing both go through atomic
+            // load + per-node lock, so this is safe and idempotent.
+            // We pass on it if it costs us correctness (process may
+            // rotate n, after which our descent's parent_ovl is
+            // stale) — return retry in that case so the descent
+            // restarts cleanly.
+            if (n->needs_rebalance.load(std::memory_order_acquire)) {
+                process_pending_if_set(n);
+                return status::retry;
+            }
+
             // Descend.
             parent = n;
             pv = nv;
@@ -399,9 +422,31 @@ private:
     // on this node (some other ascent will pick it up — every insert
     // does a full ascent, so any persistent imbalance gets handled).
     void fix_heights_and_rebalance_ascent(node* start) {
+        constexpr int max_passes = 4;
+        for (int pass = 0; pass < max_passes; ++pass) {
+            single_ascent_pass(start);
+            if (path_is_avl_balanced(start)) return;
+            // Some node on the path is still unbalanced — another
+            // ascent racing with us mutated heights underneath. Yield
+            // and try the whole ascent again. Capped at max_passes
+            // so we don't livelock if the contention is sustained;
+            // any remaining imbalance will be picked up by the next
+            // insert (every insert does a full ascent).
+            std::this_thread::yield();
+        }
+    }
+
+    // One ascent pass: walk from start to the holder, updating
+    // heights and triggering rotations where the local balance
+    // factor exceeds 1. Per-node retry loop handles the "rotation
+    // validation lost a race" case for that single node. If after
+    // all retries the node is still unbalanced, set its
+    // needs_rebalance flag so subsequent operations can pick it up.
+    void single_ascent_pass(node* start) {
         constexpr int max_retries = 8;
         node* n = start;
         while (n != nullptr && n != &holder_) {
+            bool converged = false;
             for (int attempt = 0; attempt < max_retries; ++attempt) {
                 std::int32_t bf = 0;
                 {
@@ -414,17 +459,76 @@ private:
                     n->height.store(1 + std::max(hl, hr), std::memory_order_release);
                     bf = hr - hl;
                 }
-
-                if (bf <= 1 && bf >= -1) break;   // balanced; advance
+                if (bf <= 1 && bf >= -1) { converged = true; break; }
                 const bool rotated = (bf > 1) ? try_right_heavy_rotate(n)
                                               : try_left_heavy_rotate(n);
-                if (rotated) break;               // success; advance
-                // Validation failed; another ascent's heights moved
-                // under us. Yield and re-evaluate this node.
+                if (rotated) { converged = true; break; }
                 std::this_thread::yield();
+            }
+            if (converged) {
+                n->needs_rebalance.store(false, std::memory_order_release);
+            } else {
+                n->needs_rebalance.store(true, std::memory_order_release);
             }
             n = n->parent.load(std::memory_order_acquire);
         }
+    }
+
+    // Inline helper used by attempt_insert's descent: if `n` has its
+    // needs_rebalance flag set, drop our descent context, rebalance
+    // n in place, and let the caller restart from root. This catches
+    // off-path imbalances left behind by prior ascents that lost
+    // their rotation races. We don't process pendings encountered in
+    // contains() — readers don't mutate the structure.
+    void process_pending_if_set(node* n) {
+        if (n && n->needs_rebalance.load(std::memory_order_acquire)) {
+            // Try a tighter retry on this single node. The general
+            // ascent's max_retries is fine here too.
+            constexpr int max_retries = 8;
+            for (int attempt = 0; attempt < max_retries; ++attempt) {
+                std::int32_t bf = 0;
+                {
+                    std::scoped_lock nl{n->lock};
+                    if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+                        return;
+                    }
+                    const auto hl = height_of(n->left.load(std::memory_order_acquire));
+                    const auto hr = height_of(n->right.load(std::memory_order_acquire));
+                    n->height.store(1 + std::max(hl, hr), std::memory_order_release);
+                    bf = hr - hl;
+                }
+                if (bf <= 1 && bf >= -1) {
+                    n->needs_rebalance.store(false, std::memory_order_release);
+                    return;
+                }
+                const bool rotated = (bf > 1) ? try_right_heavy_rotate(n)
+                                              : try_left_heavy_rotate(n);
+                if (rotated) {
+                    n->needs_rebalance.store(false, std::memory_order_release);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            // Still unbalanced; leave flag set for the next op.
+        }
+    }
+
+    // Lock-free verification: scan from `start` to the holder and
+    // return true iff every node currently satisfies |bf| <= 1.
+    // Heights are atomic; the answer is a snapshot that may already
+    // be stale by the time we return — but if it says "balanced", we
+    // know there *was* a moment in our scan where the invariant held.
+    // The outer ascent loop uses this as a heuristic for "should I
+    // do another pass".
+    [[nodiscard]] bool path_is_avl_balanced(node* start) const noexcept {
+        node* n = start;
+        while (n != nullptr && n != &holder_) {
+            const auto hl = height_of(n->left.load(std::memory_order_acquire));
+            const auto hr = height_of(n->right.load(std::memory_order_acquire));
+            if (std::abs(hr - hl) > 1) return false;
+            n = n->parent.load(std::memory_order_acquire);
+        }
+        return true;
     }
 
     [[nodiscard]] static std::int32_t height_of(const node* n) noexcept {
