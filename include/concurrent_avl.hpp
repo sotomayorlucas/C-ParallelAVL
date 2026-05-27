@@ -387,28 +387,42 @@ private:
     //     before the rotation tries to re-acquire it as part of the
     //     bigger std::lock chain.
     // -----------------------------------------------------------------
+    // Pending-rebalance retry loop.
+    //
+    // A rotation can fail validation because some prerequisite (n's
+    // parent, n's child y, y's child z) moved while we dropped n's
+    // own lock to acquire the multi-lock chain. The "lazy rebalance"
+    // policy from Bronson's paper handles this by enqueueing the
+    // pending work for later processing; we use a tighter local form:
+    // retry the same node up to MAX_RETRIES with a yield between
+    // attempts. If after all retries it's still unbalanced we give up
+    // on this node (some other ascent will pick it up — every insert
+    // does a full ascent, so any persistent imbalance gets handled).
     void fix_heights_and_rebalance_ascent(node* start) {
+        constexpr int max_retries = 8;
         node* n = start;
-        // The ascent stops at the holder. The holder is not a real
-        // AVL node — its right subtree IS the entire tree, so its
-        // balance factor is meaningless (always heavily right-skewed).
-        // Rotating "around" the holder would be a category error.
         while (n != nullptr && n != &holder_) {
-            std::int32_t bf = 0;
-            {
-                std::scoped_lock nl{n->lock};
-                if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
-                    return;
+            for (int attempt = 0; attempt < max_retries; ++attempt) {
+                std::int32_t bf = 0;
+                {
+                    std::scoped_lock nl{n->lock};
+                    if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+                        return;
+                    }
+                    const auto hl = height_of(n->left.load(std::memory_order_acquire));
+                    const auto hr = height_of(n->right.load(std::memory_order_acquire));
+                    n->height.store(1 + std::max(hl, hr), std::memory_order_release);
+                    bf = hr - hl;
                 }
-                const auto hl = height_of(n->left.load(std::memory_order_acquire));
-                const auto hr = height_of(n->right.load(std::memory_order_acquire));
-                n->height.store(1 + std::max(hl, hr), std::memory_order_release);
-                bf = hr - hl;
+
+                if (bf <= 1 && bf >= -1) break;   // balanced; advance
+                const bool rotated = (bf > 1) ? try_right_heavy_rotate(n)
+                                              : try_left_heavy_rotate(n);
+                if (rotated) break;               // success; advance
+                // Validation failed; another ascent's heights moved
+                // under us. Yield and re-evaluate this node.
+                std::this_thread::yield();
             }
-
-            if (bf > 1)        try_right_heavy_rotate(n);
-            else if (bf < -1)  try_left_heavy_rotate(n);
-
             n = n->parent.load(std::memory_order_acquire);
         }
     }
@@ -429,9 +443,12 @@ private:
     // Right-heavy rotation entry. n is right-heavy (bf > 1). Decides
     // between single rotate_left (RR case) and double rotate_right_then_left
     // (RL case) based on y = n.right's own balance.
-    void try_right_heavy_rotate(node* n) {
+    // Returns true if a rotation was applied, false if validation failed
+    // (some prerequisite — y, z, parent relationship — moved while we
+    // dropped n's lock).  On false, the ascent retries this node.
+    [[nodiscard]] bool try_right_heavy_rotate(node* n) {
         node* y = n->right.load(std::memory_order_acquire);
-        if (!y) return;
+        if (!y) return false;
         const auto y_hl = height_of(y->left.load(std::memory_order_acquire));
         const auto y_hr = height_of(y->right.load(std::memory_order_acquire));
         const bool double_case = (y_hr - y_hl) < 0;
@@ -441,32 +458,32 @@ private:
 
         if (double_case) {
             node* z = y->left.load(std::memory_order_acquire);
-            if (!z) return;
+            if (!z) return false;
             std::lock(p_lock, n->lock, y->lock, z->lock);
             std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
             std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
             std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
             std::lock_guard<std::mutex> zl{z->lock, std::adopt_lock};
-            if (!validate_rotation(p, n, y, true)) return;
-            if (n->right.load(std::memory_order_acquire) != y) return;
-            if (y->left.load(std::memory_order_acquire) != z)  return;
+            if (!validate_rotation(p, n, y, true)) return false;
+            if (n->right.load(std::memory_order_acquire) != y) return false;
+            if (y->left.load(std::memory_order_acquire) != z)  return false;
             do_rotate_right_under_locks(n, y, z);
-            // After step 1, n's right is z. Step 2: rotate left around n.
             node* new_y = n->right.load(std::memory_order_acquire);
             do_rotate_left_under_locks(p, n, new_y);
-        } else {
-            std::lock(p_lock, n->lock, y->lock);
-            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
-            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
-            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
-            if (!validate_rotation(p, n, y, true)) return;
-            do_rotate_left_under_locks(p, n, y);
+            return true;
         }
+        std::lock(p_lock, n->lock, y->lock);
+        std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+        std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+        std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+        if (!validate_rotation(p, n, y, true)) return false;
+        do_rotate_left_under_locks(p, n, y);
+        return true;
     }
 
-    void try_left_heavy_rotate(node* n) {
+    [[nodiscard]] bool try_left_heavy_rotate(node* n) {
         node* y = n->left.load(std::memory_order_acquire);
-        if (!y) return;
+        if (!y) return false;
         const auto y_hl = height_of(y->left.load(std::memory_order_acquire));
         const auto y_hr = height_of(y->right.load(std::memory_order_acquire));
         const bool double_case = (y_hl - y_hr) < 0;
@@ -476,26 +493,27 @@ private:
 
         if (double_case) {
             node* z = y->right.load(std::memory_order_acquire);
-            if (!z) return;
+            if (!z) return false;
             std::lock(p_lock, n->lock, y->lock, z->lock);
             std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
             std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
             std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
             std::lock_guard<std::mutex> zl{z->lock, std::adopt_lock};
-            if (!validate_rotation(p, n, y, false)) return;
-            if (n->left.load(std::memory_order_acquire) != y)   return;
-            if (y->right.load(std::memory_order_acquire) != z)  return;
+            if (!validate_rotation(p, n, y, false)) return false;
+            if (n->left.load(std::memory_order_acquire) != y)   return false;
+            if (y->right.load(std::memory_order_acquire) != z)  return false;
             do_rotate_left_under_locks(n, y, z);
             node* new_y = n->left.load(std::memory_order_acquire);
             do_rotate_right_under_locks(p, n, new_y);
-        } else {
-            std::lock(p_lock, n->lock, y->lock);
-            std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
-            std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
-            std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
-            if (!validate_rotation(p, n, y, false)) return;
-            do_rotate_right_under_locks(p, n, y);
+            return true;
         }
+        std::lock(p_lock, n->lock, y->lock);
+        std::lock_guard<std::mutex> pl{p_lock, std::adopt_lock};
+        std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+        std::lock_guard<std::mutex> yl{y->lock, std::adopt_lock};
+        if (!validate_rotation(p, n, y, false)) return false;
+        do_rotate_right_under_locks(p, n, y);
+        return true;
     }
 
     // Post-lock validation. The triple (p, n, y) must still match the
