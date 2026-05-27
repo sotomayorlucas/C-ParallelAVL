@@ -144,18 +144,24 @@ miss — uncommon in practice and only inflates by a constant `S`.
 ### Lock hierarchy (acquired in this order)
 
 ```
-topology_mutex_     (parallel_avl, shared_mutex)
+topology gate       (parallel_avl, hand-rolled reader counter + scaling mutex)
   shard_mutex_      (one per shard, plain mutex)
     redirect_mutex_ (redirect_index, shared_mutex)
 ```
 
+`parallel_avl` does NOT use `std::shared_mutex` for topology; instead it
+uses a hand-rolled reader gate (`active_readers_` atomic counter +
+`scaling_wanted_` flag + `scaling_mutex_`). Functionally equivalent to a
+RW-mutex but avoids the libstdc++ `pthread_rwlock_t` machinery — ~15%
+faster on the read-only stress test in our measurements.
+
 Held by:
 
-| Operation                          | `topology_mutex_` | `shard_mutex_` | `redirect_mutex_` |
-|------------------------------------|-------------------|----------------|-------------------|
-| `insert / contains / get / remove / visit / range_query` | **shared** | exclusive (one shard) | shared on lookup, exclusive on record |
-| `add_shard / remove_shard / force_rebalance / clear`     | **exclusive** | — | exclusive at end |
-| `size / num_shards / snapshot / balance_score`           | **shared** | — | shared |
+| Operation                          | topology gate | `shard_mutex_` | `redirect_mutex_` |
+|------------------------------------|---------------|----------------|-------------------|
+| `insert / contains / get / remove / visit / range_query` | **reader** | exclusive (one shard) | shared on lookup, exclusive on record |
+| `add_shard / remove_shard / force_rebalance / clear`     | **writer** (drains readers) | — | exclusive at end |
+| `size / num_shards / snapshot / balance_score`           | **reader** | — | shared |
 
 ### Memory order on atomic counters
 
@@ -206,10 +212,13 @@ Single-thread shard hot path (5M ops, gcc 13.3 `-O3 -march=native -flto`):
 Multi-thread sustained (8 threads, 4M ops, 70/15/15 read/insert/delete):
 ~2.7 M ops/s for both — within noise.
 
-The `shared_mutex` for topology safety costs ~30% on the pure-read
-stress test versus an unsynchronised read. That overhead buys
-correctness: the original C version use-after-free'd under concurrent
-scaling, confirmed by AddressSanitizer.
+Topology safety overhead: the hand-rolled reader gate
+(`active_readers_` + `scaling_wanted_`) measures ~15% faster on a
+read-only microbench than `std::shared_mutex` would (4.3 vs 3.75 M
+ops/s, 8 threads, 20M total ops). Versus an unsynchronised read it
+still costs ~20%. That overhead buys correctness: the original C
+version use-after-free'd under concurrent scaling, confirmed by
+AddressSanitizer.
 
 ## License
 

@@ -12,7 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -60,12 +60,12 @@ public:
     ~parallel_avl() = default;
 
     [[nodiscard]] std::size_t num_shards() const noexcept {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         return num_shards_;
     }
 
     [[nodiscard]] PAVL_ALWAYS_INLINE std::size_t size() const noexcept {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         std::size_t total = 0;
         for (std::size_t i = 0; i < num_shards_; ++i) total += shards_raw_[i]->size();
         return total;
@@ -81,7 +81,7 @@ public:
 
     // try_insert: no-op if the key is already present anywhere in the tree.
     insert_outcome try_insert(const Key& key, Value value) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
@@ -99,7 +99,7 @@ public:
 
     // insert_or_assign: overwrites existing value, reports if it was new.
     insert_outcome insert_or_assign(const Key& key, Value value) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
@@ -118,7 +118,7 @@ public:
     // try_emplace: construct Value in-place if the key is absent.
     template <typename... Args>
     insert_outcome try_emplace(const Key& key, Args&&... args) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
@@ -135,7 +135,7 @@ public:
     }
 
     [[nodiscard]] PAVL_HOT bool contains(const Key& key) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
         if (shards_raw_[natural]->contains(key)) [[likely]] return true;
@@ -161,7 +161,7 @@ public:
     [[nodiscard]] PAVL_HOT std::optional<Value> get(const Key& key)
         requires std::copyable<Value>
     {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
         if (auto v = shards_raw_[natural]->get(key)) [[likely]] return v;
@@ -186,7 +186,7 @@ public:
 
     template <std::invocable<Value&> F>
     [[nodiscard]] bool visit(const Key& key, F&& f) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
         if (shards_raw_[natural]->visit(key, f)) [[likely]] return true;
@@ -206,7 +206,7 @@ public:
     }
 
     bool remove(const Key& key) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         const auto h = key_hash(key);
         const auto natural = static_cast<std::size_t>(h) % num_shards_;
@@ -235,7 +235,7 @@ public:
     }
 
     [[nodiscard]] std::vector<key_value> range_query(const Key& lo, const Key& hi, std::size_t max_results) {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         std::vector<key_value> out;
         total_ops_.fetch_add(1, std::memory_order_relaxed);
         out.reserve(std::min(max_results, std::size_t{1024}));
@@ -252,12 +252,12 @@ public:
     }
 
     [[nodiscard]] double balance_score() const {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         return router_raw_->snapshot().balance_score;
     }
 
     void clear() {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         for (std::size_t i = 0; i < num_shards_; ++i) shards_raw_[i]->clear();
         redirect_index_.clear();
         total_ops_.store(0, std::memory_order_relaxed);
@@ -265,7 +265,7 @@ public:
     }
 
     bool add_shard() {
-        std::unique_lock topo_lock{topology_mutex_};
+        write_guard topo_lock{this};
         shards_.push_back(std::make_unique<shard_type>());
         const auto rs = router_raw_->snapshot();
         const auto strategy = rs.balance_score > 0.9
@@ -278,7 +278,7 @@ public:
     }
 
     bool remove_shard() {
-        std::unique_lock topo_lock{topology_mutex_};
+        write_guard topo_lock{this};
         if (shards_.size() <= 1) return false;
         auto removing = std::move(shards_.back());
         shards_.pop_back();
@@ -296,7 +296,7 @@ public:
     }
 
     void force_rebalance() {
-        std::unique_lock topo_lock{topology_mutex_};
+        write_guard topo_lock{this};
         const auto total_size_unlocked = [this] {
             std::size_t total = 0;
             for (std::size_t i = 0; i < num_shards_; ++i) total += shards_raw_[i]->size();
@@ -326,7 +326,7 @@ public:
     }
 
     [[nodiscard]] stats snapshot() const {
-        std::shared_lock topo_lock{topology_mutex_};
+        read_guard topo_lock{this};
         stats s{};
         s.num_shards = num_shards_;
         s.total_ops = total_ops_.load(std::memory_order_relaxed);
@@ -368,11 +368,72 @@ private:
         router_raw_ = router_.get();
     }
 
-    // topology_mutex_ guards mutation of shards_/router_ (unique_lock on
-    // add_shard/remove_shard/force_rebalance) vs concurrent reads of the
-    // cached raw pointers from hot paths (shared_lock on insert/contains/...).
-    // Without this, concurrent scaling races against in-flight ops.
-    mutable std::shared_mutex topology_mutex_;
+    // ----- topology protection (hand-rolled RW gate) ------------------
+    //
+    // Hot paths use the cached raw pointers (shards_raw_/router_raw_/
+    // num_shards_). A scaling op (add/remove/rebalance/clear) needs to
+    // mutate those without freeing storage that an in-flight reader is
+    // still touching. The original implementation used std::shared_mutex,
+    // which cost ~30% on the pure-read stress test; this hand-rolled
+    // counter is the same idea but avoids the pthread_rwlock_t machinery
+    // libstdc++ uses underneath shared_mutex.
+    //
+    // Protocol:
+    //   reader::enter  ->  fetch_add(active_readers_, acquire)
+    //                      if scaling_wanted_ != 0  rollback + block
+    //   reader::exit   ->  fetch_sub(active_readers_, release)
+    //   writer::enter  ->  scaling_mutex_.lock()                     // serialize writers
+    //                      scaling_wanted_.store(1, release)         // block new readers
+    //                      spin/yield until active_readers_ == 0     // drain
+    //   writer::exit   ->  scaling_wanted_.store(0, release)
+    //                      scaling_mutex_.unlock()                   // unblock readers
+    //
+    // Padded to its own cache line to keep the writer's flag away from
+    // unrelated atomics (size_/router stats).
+    alignas(cache_line_size) mutable std::atomic<std::size_t> active_readers_{0};
+    alignas(cache_line_size) mutable std::atomic<int>         scaling_wanted_{0};
+    mutable std::mutex scaling_mutex_;
+
+    class read_guard {
+        const parallel_avl* t_;
+    public:
+        PAVL_ALWAYS_INLINE explicit read_guard(const parallel_avl* t) noexcept : t_{t} {
+            while (true) {
+                t_->active_readers_.fetch_add(1, std::memory_order_acquire);
+                if (t_->scaling_wanted_.load(std::memory_order_relaxed) == 0) [[likely]] return;
+                t_->active_readers_.fetch_sub(1, std::memory_order_release);
+                // A writer wants to scale. Park on scaling_mutex_ — it
+                // is held by the writer for the duration of the mutation.
+                t_->scaling_mutex_.lock();
+                t_->scaling_mutex_.unlock();
+            }
+        }
+        PAVL_ALWAYS_INLINE ~read_guard() noexcept {
+            t_->active_readers_.fetch_sub(1, std::memory_order_release);
+        }
+        read_guard(const read_guard&) = delete;
+        read_guard& operator=(const read_guard&) = delete;
+    };
+
+    class write_guard {
+        parallel_avl* t_;
+    public:
+        explicit write_guard(parallel_avl* t) : t_{t} {
+            t_->scaling_mutex_.lock();
+            t_->scaling_wanted_.store(1, std::memory_order_release);
+            // Drain in-flight readers. After this loop returns we know
+            // no thread is observing the *current* shards_raw_/router_raw_.
+            while (t_->active_readers_.load(std::memory_order_acquire) > 0) {
+                std::this_thread::yield();
+            }
+        }
+        ~write_guard() noexcept {
+            t_->scaling_wanted_.store(0, std::memory_order_release);
+            t_->scaling_mutex_.unlock();
+        }
+        write_guard(const write_guard&) = delete;
+        write_guard& operator=(const write_guard&) = delete;
+    };
 
     std::vector<std::unique_ptr<shard_type>> shards_;
     std::vector<shard_type*> shards_storage_;
