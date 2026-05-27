@@ -38,19 +38,21 @@ HEADERS = $(INC_DIR)/common.hpp \
           $(INC_DIR)/shard.hpp \
           $(INC_DIR)/router.hpp \
           $(INC_DIR)/redirect_index.hpp \
-          $(INC_DIR)/parallel_avl.hpp
+          $(INC_DIR)/parallel_avl.hpp \
+          $(INC_DIR)/concurrent_avl.hpp
 
 BENCHMARK     = benchmark_parallel$(EXE)
 TEST          = test_avl$(EXE)
+TEST_CAVL     = test_concurrent_avl$(EXE)
 COMPILER_CMP  = compiler_compare$(EXE)
 STRESS        = stress_test$(EXE)
 
-.PHONY: all clean debug release test benchmark stress compare help
+.PHONY: all clean debug release test test-cavl benchmark stress compare help
 
 all: release
 
 release: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
-release: $(BENCHMARK) $(TEST)
+release: $(BENCHMARK) $(TEST) $(TEST_CAVL)
 
 debug: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_DEBUG)
 debug: LDFLAGS += -fsanitize=address,undefined
@@ -60,6 +62,9 @@ $(BENCHMARK): $(BENCH_DIR)/benchmark_parallel.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 $(TEST): $(TEST_DIR)/test_avl.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+$(TEST_CAVL): $(TEST_DIR)/test_concurrent_avl.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 $(COMPILER_CMP): $(BENCH_DIR)/compiler_compare.cpp $(HEADERS)
@@ -73,8 +78,13 @@ benchmark: $(BENCHMARK)
 	./$(BENCHMARK)
 
 test: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
-test: $(TEST)
+test: $(TEST) $(TEST_CAVL)
 	./$(TEST)
+	./$(TEST_CAVL)
+
+test-cavl: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
+test-cavl: $(TEST_CAVL)
+	./$(TEST_CAVL)
 
 stress: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
 stress: $(STRESS)
@@ -93,7 +103,7 @@ ifeq ($(PLATFORM),windows)
 	@if exist $(STRESS) $(RM) $(STRESS)
 else
 	$(RMDIR) $(BUILD_DIR)
-	$(RM) $(BENCHMARK) $(TEST) $(COMPILER_CMP) $(STRESS)
+	$(RM) $(BENCHMARK) $(TEST) $(TEST_CAVL) $(COMPILER_CMP) $(STRESS)
 endif
 
 help:
