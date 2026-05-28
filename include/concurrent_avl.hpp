@@ -23,6 +23,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace pavl {
 
@@ -64,6 +65,176 @@ enum class dir : std::uint8_t { left = 0, right = 1 };
 [[nodiscard]] constexpr dir other(dir d) noexcept {
     return d == dir::left ? dir::right : dir::left;
 }
+
+}  // namespace detail::cavl
+
+namespace detail::cavl {
+
+// =====================================================================
+// Epoch-based reclamation (EBR)
+// =====================================================================
+//
+// A single process-global domain shared by all concurrent_avl trees.
+// Type-erased: retire() takes a pointer + a deleter, so the domain
+// doesn't need to know the node type.
+//
+// Protocol (quiescent-state, 2-epoch grace period):
+//
+//   - global_epoch_ monotonically increases.
+//   - Each thread that ever enters a critical section registers a
+//     `participant` (lazily, via thread_local). Participants are
+//     never unregistered — a bounded leak of one cache-line per
+//     thread for the life of the process, which is the standard
+//     simplification and avoids the thread-death teardown race.
+//   - A `guard` announces the thread's local epoch on construction
+//     (local_epoch = global_epoch) and clears it on destruction
+//     (local_epoch = quiescent). While quiescent a thread holds no
+//     references into the tree, so anything retired before it went
+//     quiescent is safe to free w.r.t. that thread.
+//   - retire(p, deleter) stamps p with the current global epoch and
+//     puts it in a limbo list. Every so often we try to advance the
+//     epoch: if every registered participant is either quiescent or
+//     already at global_epoch, we bump global_epoch and free
+//     everything stamped <= new_epoch - 2.
+//
+// Why 2 epochs: a node retired in epoch E might still be referenced
+// by a thread that entered its critical section in epoch E. That
+// thread will exit and re-enter; by the time global_epoch reaches
+// E+2, every thread has gone quiescent at least once since E, so no
+// live reference to the node can remain.
+class ebr {
+private:
+    static constexpr std::uint64_t reclaim_interval = 64;
+
+    struct retired {
+        void* ptr;
+        void (*deleter)(void*);
+        std::uint64_t epoch;
+    };
+
+    struct alignas(cache_line_size) participant {
+        std::atomic<std::uint64_t> local_epoch{0};  // 0 == quiescent
+        std::uint64_t depth{0};               // guard nesting (thread-local)
+        std::uint64_t retire_count{0};        // reclaim throttling
+        std::vector<retired> limbo;
+        participant* next{nullptr};
+    };
+
+    std::atomic<std::uint64_t> global_epoch_{1};
+    std::atomic<participant*>  head_{nullptr};
+    std::mutex                 registry_mutex_;
+
+    ebr() = default;
+    ~ebr() {
+        participant* p = head_.load(std::memory_order_acquire);
+        while (p) {
+            for (auto& r : p->limbo) r.deleter(r.ptr);
+            participant* next = p->next;
+            delete p;
+            p = next;
+        }
+    }
+    ebr(const ebr&) = delete;
+    ebr& operator=(const ebr&) = delete;
+
+    [[nodiscard]] participant& local_participant() {
+        thread_local participant* mine = register_participant();
+        return *mine;
+    }
+
+    [[nodiscard]] participant* register_participant() {
+        auto* p = new participant{};
+        std::scoped_lock lk{registry_mutex_};
+        p->next = head_.load(std::memory_order_relaxed);
+        head_.store(p, std::memory_order_release);
+        return p;
+    }
+
+    void try_advance_and_reclaim(participant& self) {
+        const auto cur = global_epoch_.load(std::memory_order_acquire);
+        bool can_advance = true;
+        {
+            std::scoped_lock lk{registry_mutex_};
+            for (participant* p = head_.load(std::memory_order_acquire);
+                 p != nullptr; p = p->next) {
+                const auto e = p->local_epoch.load(std::memory_order_acquire);
+                if (e != 0 && e != cur) { can_advance = false; break; }
+            }
+        }
+        if (can_advance) {
+            std::uint64_t expected = cur;
+            global_epoch_.compare_exchange_strong(expected, cur + 1,
+                                                   std::memory_order_acq_rel);
+        }
+        // Reclaim from THIS thread's limbo: anything stamped at epoch
+        // <= global_epoch_ - 2 is safe (every thread has gone
+        // quiescent at least once since then).
+        const auto safe = global_epoch_.load(std::memory_order_acquire);
+        auto& limbo = self.limbo;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < limbo.size(); ++i) {
+            if (limbo[i].epoch + 2 <= safe) {
+                limbo[i].deleter(limbo[i].ptr);
+            } else {
+                limbo[kept++] = limbo[i];
+            }
+        }
+        limbo.resize(kept);
+    }
+
+public:
+    static constexpr std::uint64_t quiescent = 0;
+
+    [[nodiscard]] static ebr& instance() {
+        static ebr e;
+        return e;
+    }
+
+    // RAII critical-section guard. Announces the thread's epoch on
+    // entry, returns it to quiescent on exit. Re-entrant via a
+    // per-thread depth counter.
+    class guard {
+    public:
+        guard() : self_{instance().local_participant()} {
+            if (self_.depth++ == 0) {
+                self_.local_epoch.store(
+                    instance().global_epoch_.load(std::memory_order_acquire),
+                    std::memory_order_release);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+            }
+        }
+        ~guard() {
+            if (--self_.depth == 0) {
+                self_.local_epoch.store(quiescent, std::memory_order_release);
+            }
+        }
+        guard(const guard&) = delete;
+        guard& operator=(const guard&) = delete;
+    private:
+        participant& self_;
+    };
+
+    void retire(void* p, void (*deleter)(void*)) {
+        auto& self = local_participant();
+        const auto e = global_epoch_.load(std::memory_order_acquire);
+        self.limbo.push_back({p, deleter, e});
+        if (++self.retire_count % reclaim_interval == 0) {
+            try_advance_and_reclaim(self);
+        }
+    }
+
+    // Drain every limbo list NOW. Only safe when no thread is inside
+    // a critical section (e.g. process teardown). Not used in the
+    // normal path; kept for completeness / test harnesses.
+    void drain_all() {
+        std::scoped_lock lk{registry_mutex_};
+        for (participant* p = head_.load(std::memory_order_acquire);
+             p != nullptr; p = p->next) {
+            for (auto& r : p->limbo) r.deleter(r.ptr);
+            p->limbo.clear();
+        }
+    }
+};
 
 }  // namespace detail::cavl
 
@@ -138,6 +309,12 @@ private:
         }
     };
 
+    // EBR deleter for retired nodes (type-erased entry point for the
+    // global epoch domain).
+    static void reclaim_node(void* p) noexcept {
+        delete static_cast<node*>(p);
+    }
+
     // Sentinel "root holder". holder_.right is the real root of the
     // tree. holder_.left is never used. The descent always starts here,
     // with dir::right, validated against holder_.changeOVL — this is
@@ -196,6 +373,7 @@ public:
     // Lookup: validating descent. No locks.
     // =================================================================
     [[nodiscard]] bool contains(const Key& key) const {
+        detail::cavl::ebr::guard g;
         while (true) {
             const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
             // The descent's first "edge" is holder_.right; the parent
@@ -216,6 +394,7 @@ public:
     // (which will simply skip the overwrite branch).
     // =================================================================
     void insert(Key key, Value value) {
+        detail::cavl::ebr::guard g;
         while (true) {
             const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
             node* root = holder_.right.load(std::memory_order_acquire);
@@ -236,6 +415,7 @@ public:
     // Fase 2b will add the physical unlink path for nodes with 0/1
     // children, restoring O(log n) memory.
     bool remove(const Key& key) {
+        detail::cavl::ebr::guard g;
         while (true) {
             const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
             node* root = holder_.right.load(std::memory_order_acquire);
@@ -496,6 +676,13 @@ private:
                     if (p_post && p_post != &holder_) {
                         fix_heights_and_rebalance_ascent(p_post);
                     }
+                    // n is now unreachable from the tree. Hand it to
+                    // EBR — it stays alive until every thread that
+                    // might hold a stale reference has gone quiescent
+                    // (2 epochs), then gets delete'd. We're inside our
+                    // own epoch guard here, so n won't be reclaimed
+                    // before we return.
+                    detail::cavl::ebr::instance().retire(n, &reclaim_node);
                 }
                 return status::removed;
             }
