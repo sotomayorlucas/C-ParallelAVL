@@ -472,20 +472,31 @@ private:
             }
 
             if (!(key < n->key) && !(n->key < key)) {
-                // Matched n's key. Take n's lock and atomically:
-                //   - check that n's OVL is still nv (no rotation
-                //     touched n between our descent and the lock);
-                //   - check that n isn't already routing (a concurrent
-                //     remove may have already turned it).
-                std::scoped_lock lk{n->lock};
-                if (n->changeOVL.load(std::memory_order_acquire) != nv) {
-                    return status::retry;
+                // Matched n's key.
+                {
+                    // Inner scope so n->lock is released before the
+                    // physical-unlink chain (which re-acquires it
+                    // under std::lock).
+                    std::scoped_lock lk{n->lock};
+                    if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                        return status::retry;
+                    }
+                    if (n->is_routing.load(std::memory_order_relaxed)) {
+                        return status::not_found;       // already removed
+                    }
+                    n->is_routing.store(true, std::memory_order_release);
+                    size_.fetch_sub(1, std::memory_order_relaxed);
                 }
-                if (n->is_routing.load(std::memory_order_relaxed)) {
-                    return status::not_found;       // already removed
+                // Fase 2b: physical unlink for 0/1-child routing nodes.
+                // Failure (e.g., the node now has 2 children because
+                // of a concurrent insert into the empty slot) just
+                // leaves it as a routing node — a later op collects.
+                if (try_physical_unlink(n)) {
+                    node* p_post = n->parent.load(std::memory_order_acquire);
+                    if (p_post && p_post != &holder_) {
+                        fix_heights_and_rebalance_ascent(p_post);
+                    }
                 }
-                n->is_routing.store(true, std::memory_order_release);
-                size_.fetch_sub(1, std::memory_order_relaxed);
                 return status::removed;
             }
 
@@ -829,6 +840,91 @@ private:
                             + detail::cavl::ovl_version_one)
                            & detail::cavl::ovl_version_mask,
                            std::memory_order_release);
+    }
+
+    // Mark n as unlinked. Bumps the version too (so any in-flight
+    // descenders that captured an older OVL retry instead of
+    // chasing pointers that lead nowhere).
+    static void set_unlinked(node* n) noexcept {
+        const ovl_t cur = n->changeOVL.load(std::memory_order_acquire);
+        n->changeOVL.store(((cur & detail::cavl::ovl_version_mask)
+                            + detail::cavl::ovl_version_one)
+                           | detail::cavl::ovl_unlinked_bit,
+                           std::memory_order_release);
+    }
+
+    // Fase 2b: try to physically unlink a routing node with 0 or 1
+    // children. Returns true if the node was unlinked from the tree
+    // (its memory is intentionally NOT freed yet — EBR / Fase 3 will
+    // handle reclamation; until then the node is a leak that's
+    // bounded by the high-water-mark of distinct keys ever removed).
+    //
+    // Why only 0/1 children: a 2-child unlink would need to splice
+    // in the in-order successor, which is another descent + rotation
+    // cascade. Bronson keeps 2-child removed nodes as routing nodes
+    // (Fase 2a behaviour) and only physically removes when collapse
+    // is structurally trivial.
+    //
+    // Lock chain (deadlock-free via std::lock):
+    //   parent(n), n, only_child (if present)
+    [[nodiscard]] bool try_physical_unlink(node* n) {
+        node* p = n->parent.load(std::memory_order_acquire);
+        if (!p) return false;  // shouldn't happen (holder_ is always above)
+
+        node* L = n->left.load(std::memory_order_acquire);
+        node* R = n->right.load(std::memory_order_acquire);
+        if (L && R) return false;  // 2 children → stays routing
+        node* only_child = L ? L : R;
+
+        auto do_unlink = [&]() {
+            // Mark n as unlinked under p's lock so concurrent
+            // descenders that took p.OVL pre-unlink will see the
+            // bump and retry.
+            set_shrinking(p);
+            set_unlinked(n);
+            if (p->left.load(std::memory_order_acquire) == n) {
+                p->left.store(only_child, std::memory_order_release);
+            } else {
+                p->right.store(only_child, std::memory_order_release);
+            }
+            if (only_child) {
+                only_child->parent.store(p, std::memory_order_release);
+            }
+            clear_shrinking(p);
+        };
+
+        if (only_child) {
+            std::lock(p->lock, n->lock, only_child->lock);
+            std::lock_guard<std::mutex> pl{p->lock,           std::adopt_lock};
+            std::lock_guard<std::mutex> nl{n->lock,           std::adopt_lock};
+            std::lock_guard<std::mutex> cl{only_child->lock,  std::adopt_lock};
+            // Post-lock validation: nothing about (p, n, only_child)
+            // may have changed since we read them above.
+            if (n->parent.load(std::memory_order_acquire) != p) return false;
+            if (!n->is_routing.load(std::memory_order_relaxed)) return false;
+            if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire)))
+                return false;
+            node* L2 = n->left.load(std::memory_order_acquire);
+            node* R2 = n->right.load(std::memory_order_acquire);
+            if (L2 && R2) return false;
+            node* oc2 = L2 ? L2 : R2;
+            if (oc2 != only_child) return false;
+            do_unlink();
+            return true;
+        }
+
+        // 0-child case: only need p + n locks.
+        std::lock(p->lock, n->lock);
+        std::lock_guard<std::mutex> pl{p->lock, std::adopt_lock};
+        std::lock_guard<std::mutex> nl{n->lock, std::adopt_lock};
+        if (n->parent.load(std::memory_order_acquire) != p) return false;
+        if (!n->is_routing.load(std::memory_order_relaxed)) return false;
+        if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire)))
+            return false;
+        if (n->left.load(std::memory_order_acquire)  != nullptr) return false;
+        if (n->right.load(std::memory_order_acquire) != nullptr) return false;
+        do_unlink();
+        return true;
     }
 
     // -----------------------------------------------------------------
