@@ -2,6 +2,7 @@ build/
 *.o
 *.a
 benchmark_parallel
+benchmark_concurrent_vs_parallel
 test_avl
 test_concurrent_avl
 stress_test
