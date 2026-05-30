@@ -364,6 +364,164 @@ void test_avl_balance_concurrent() {
     for (i64 k = 0; k < NT * PER; ++k) EXPECT(t.contains(k));
 }
 
+// =====================================================================
+// Fase 4: insert_or_assign / try_insert / try_emplace / get
+// =====================================================================
+void test_insert_or_assign_is_overwrite() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert_or_assign(10, 100);
+    EXPECT(t.size() == 1);
+    EXPECT(t.contains(10));
+    t.insert_or_assign(10, 999);  // overwrite
+    EXPECT(t.size() == 1);
+    auto v = t.get(10);
+    EXPECT(v.has_value());
+    EXPECT(*v == 999);
+}
+
+void test_try_insert_new_key() {
+    pavl::concurrent_avl<i64, i64> t;
+    EXPECT(t.try_insert(7, 42));
+    EXPECT(t.contains(7));
+    EXPECT(t.size() == 1);
+    auto v = t.get(7);
+    EXPECT(v.has_value());
+    EXPECT(*v == 42);
+}
+
+void test_try_insert_existing_key_no_overwrite() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(7, 42);
+    EXPECT(!t.try_insert(7, 999));   // already present → false
+    EXPECT(t.size() == 1);
+    auto v = t.get(7);
+    EXPECT(v.has_value());
+    EXPECT(*v == 42);                // value untouched
+}
+
+void test_try_insert_reactivates_routing() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(7, 42);
+    EXPECT(t.remove(7));
+    EXPECT(t.size() == 0);
+    // Key may still be present in the BST as a routing node. try_insert
+    // should treat it as absent from the live set and return true,
+    // reactivating it with the new value.
+    EXPECT(t.try_insert(7, 99));
+    EXPECT(t.size() == 1);
+    auto v = t.get(7);
+    EXPECT(v.has_value());
+    EXPECT(*v == 99);
+}
+
+void test_try_emplace_new_key() {
+    pavl::concurrent_avl<i64, i64> t;
+    EXPECT(t.try_emplace(3, 333));
+    EXPECT(t.contains(3));
+    auto v = t.get(3);
+    EXPECT(v.has_value());
+    EXPECT(*v == 333);
+}
+
+void test_try_emplace_existing_key() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(3, 333);
+    EXPECT(!t.try_emplace(3, 999));
+    auto v = t.get(3);
+    EXPECT(v.has_value());
+    EXPECT(*v == 333);
+}
+
+void test_get_absent_returns_nullopt() {
+    pavl::concurrent_avl<i64, i64> t;
+    EXPECT(!t.get(42).has_value());
+    t.insert(10, 100);
+    EXPECT(!t.get(11).has_value());
+}
+
+void test_get_after_remove_returns_nullopt() {
+    pavl::concurrent_avl<i64, i64> t;
+    t.insert(10, 100);
+    EXPECT(t.get(10).has_value());
+    EXPECT(t.remove(10));
+    EXPECT(!t.get(10).has_value());
+}
+
+void test_concurrent_try_insert_one_winner_per_key() {
+    // Threads racing on try_insert for the same key set. For any
+    // given key, exactly one try_insert across all threads should
+    // return true; the rest see an already-live entry and return
+    // false. The accounting predicate is: size == sum-of-wins.
+    //
+    // Density (NT * OPS_PER / RANGE) is kept comparable to the other
+    // concurrent tests on this 4-core box — driving it higher just
+    // amplifies the Bronson rotation-retry tail without testing
+    // anything new.
+    pavl::concurrent_avl<i64, i64> t;
+    constexpr int NT = 4;
+    constexpr int RANGE = 500;
+    constexpr int OPS_PER = 1500;
+    std::atomic<int> wins{0};
+    {
+        std::vector<std::jthread> ws;
+        for (int tid = 0; tid < NT; ++tid) {
+            ws.emplace_back([&, tid] {
+                std::mt19937_64 rng(tid * 31u + 5u);
+                std::uniform_int_distribution<i64> d(0, RANGE - 1);
+                int local_wins = 0;
+                for (int i = 0; i < OPS_PER; ++i) {
+                    const auto k = d(rng);
+                    if (t.try_insert(k, k * 10 + tid)) ++local_wins;
+                }
+                wins.fetch_add(local_wins, std::memory_order_relaxed);
+            });
+        }
+    }
+    EXPECT(static_cast<int>(t.size()) == wins.load());
+    EXPECT(t.size() <= RANGE);
+}
+
+void test_concurrent_get_under_writers() {
+    // Readers using get() must see either the previous or the new
+    // value, never garbage. We only assert non-crash + lifecycle
+    // (every pre-populated key is still gettable after the run).
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 2000; ++i) t.insert(i, i);
+
+    constexpr int N_READERS = 2;
+    constexpr int N_WRITERS = 2;
+    constexpr int READS_PER = 20'000;
+    constexpr int WRITES_PER = 2000;
+
+    std::atomic<std::int64_t> hits{0};
+    {
+        std::vector<std::jthread> ws;
+        for (int i = 0; i < N_READERS; ++i) {
+            ws.emplace_back([&, i] {
+                std::mt19937_64 rng(321 + i);
+                std::uniform_int_distribution<i64> d(0, 5000);
+                std::int64_t h = 0;
+                for (int j = 0; j < READS_PER; ++j) {
+                    if (t.get(d(rng)).has_value()) ++h;
+                }
+                hits.fetch_add(h, std::memory_order_relaxed);
+            });
+        }
+        for (int i = 0; i < N_WRITERS; ++i) {
+            ws.emplace_back([&, i] {
+                std::mt19937_64 rng(654 + i);
+                std::uniform_int_distribution<i64> d(0, 5000);
+                for (int j = 0; j < WRITES_PER; ++j) {
+                    const auto k = d(rng);
+                    t.insert(k, k * 2);
+                }
+            });
+        }
+    }
+    EXPECT(hits.load() > 0);
+    for (int i = 0; i < 2000; ++i) EXPECT(t.get(i).has_value());
+}
+
 void test_insert_visible_after_return() {
     pavl::concurrent_avl<i64, i64> t;
     constexpr int NT = 8;
@@ -421,6 +579,18 @@ int main() {
     RUN(remove_many);
     RUN(concurrent_remove);
     RUN(concurrent_insert_remove_mix);
+
+    std::cout << "\n=== concurrent_avl Fase 4 — try_insert / insert_or_assign / try_emplace / get ===\n";
+    RUN(insert_or_assign_is_overwrite);
+    RUN(try_insert_new_key);
+    RUN(try_insert_existing_key_no_overwrite);
+    RUN(try_insert_reactivates_routing);
+    RUN(try_emplace_new_key);
+    RUN(try_emplace_existing_key);
+    RUN(get_absent_returns_nullopt);
+    RUN(get_after_remove_returns_nullopt);
+    RUN(concurrent_try_insert_one_winner_per_key);
+    RUN(concurrent_get_under_writers);
 
     std::cout << std::format("\n=== Results ===\nPassed: {}\nFailed: {}\n",
                              tests_passed, tests_failed);

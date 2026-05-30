@@ -1,12 +1,17 @@
-// concurrent_avl<K, V> — Fase 1a: concurrent BST with Bronson-style
-// optimistic descent. NO balancing yet (that comes in Fase 1b). NO
-// reclamation (Fase 3). NO remove (Fase 2). NO range queries (Fase 5).
+// concurrent_avl<K, V> — Bronson-style concurrent AVL.
 //
-// Goal of this file at this point: validate the changeOVL protocol
-// (versioned, validating descent + parent-lock insert) on a real
-// multi-threaded benchmark under ASan/UBSan/TSan. If this part is
-// clean, adding rotations on top is straightforward (only changes the
-// post-insert path).
+// Optimistic, validating descent (changeOVL versioning). Per-node locks
+// only for the writer path (insert publish + rotation surgery + remove
+// mark / physical unlink). Readers are lock-free except for an in-lock
+// value copy in get().
+//
+// Pieces:
+//   Fase 1a — validating descent + per-node locked insert (no rotation)
+//   Fase 1b — concurrent AVL rotations under std::lock chains
+//   Fase 2a — logical remove via routing nodes
+//   Fase 2b — physical unlink for 0/1-child routing nodes
+//   Fase 3  — epoch-based reclamation (EBR) for unlinked nodes
+//   Fase 4  — insert_or_assign / try_insert / try_emplace / get API
 //
 // Reference: Bronson, Casper, Chafi, Olukotun. "A Practical Concurrent
 // Binary Search Tree." PPoPP 2010.
@@ -387,20 +392,56 @@ public:
 
     // =================================================================
     // Insert (upsert): overwrites existing value with same key.
-    //
-    // Fase 1a returns void (full insert_outcome / try_insert etc. land
-    // in Fase 4). This entry point currently has insert_or_assign
-    // semantics — used both by callers and by the eventual try_insert
-    // (which will simply skip the overwrite branch).
+    // Same as insert_or_assign — kept under both names for callers and
+    // for std::map API parity.
     // =================================================================
     void insert(Key key, Value value) {
+        (void)do_insert<insert_policy::overwrite>(std::move(key), std::move(value));
+    }
+
+    // Explicit std::map-style alias for the overwrite semantics.
+    void insert_or_assign(Key key, Value value) {
+        (void)do_insert<insert_policy::overwrite>(std::move(key), std::move(value));
+    }
+
+    // Insert only if absent. Returns true if a new live entry was
+    // created (which includes reactivation of a routing node left
+    // behind by a prior remove), false if the key was already present
+    // with a live value (the supplied value is then discarded, not
+    // assigned). Mirrors std::map::try_emplace's return convention.
+    [[nodiscard]] bool try_insert(Key key, Value value) {
+        return do_insert<insert_policy::only_if_absent>(std::move(key), std::move(value));
+    }
+
+    // try_emplace: construct Value in place from Args once, then
+    // try_insert. If the key was already present, the constructed
+    // value is moved-into the function and destroyed on return —
+    // identical lifetime to passing Value(args...) directly to
+    // try_insert. (We construct upfront rather than deferring to the
+    // publish point because under concurrent retries a one-shot
+    // factory is fragile; the cost of one extra construction on a
+    // collision is the price for code that's clearly correct.)
+    template <class... Args>
+    [[nodiscard]] bool try_emplace(Key key, Args&&... args) {
+        Value v(std::forward<Args>(args)...);
+        return do_insert<insert_policy::only_if_absent>(std::move(key), std::move(v));
+    }
+
+    // Get a snapshot copy of the value associated with `key`.
+    // Returns std::nullopt if the key is absent or maps to a routing
+    // (logically removed) node. The copy is taken under the matched
+    // node's lock to serialise against a concurrent overwrite of
+    // n->value — without the lock the read could tear for non-trivial
+    // Value types (e.g. std::string).
+    [[nodiscard]] std::optional<Value> get(const Key& key) const {
         detail::cavl::ebr::guard g;
         while (true) {
             const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
             node* root = holder_.right.load(std::memory_order_acquire);
-            const auto r = attempt_insert(&holder_, holder_ovl, root, key, value);
+            std::optional<Value> out;
+            const auto r = attempt_get_value(&holder_, holder_ovl, root, key, out);
             if (r == status::retry) continue;
-            return;
+            return out;
         }
     }
 
@@ -426,14 +467,23 @@ public:
     }
 
 private:
-    // attempt_get / attempt_insert return one of these.
-    //   found      — for contains: key present
-    //   not_found  — for contains: key absent, descent ended at a null slot
-    //   inserted   — for insert: a new node was created (or value overwritten)
-    //   retry      — the descent observed inconsistency; restart from root
+    // attempt_get / attempt_insert / attempt_remove return one of these.
+    //   found        — for contains: key present
+    //   not_found    — for contains: key absent, descent ended at a null slot
+    //   inserted     — for insert: a new live entry was created (or assigned)
+    //   not_inserted — for try_insert: key was already live, no change
+    //   removed      — for remove: a live entry was demoted to routing
+    //   retry        — the descent observed inconsistency; restart from root
     enum class status : std::uint8_t {
-        found, not_found, inserted, removed, retry
+        found, not_found, inserted, not_inserted, removed, retry
     };
+
+    // insert dispatch policy:
+    //   overwrite      — assign on key match (insert / insert_or_assign)
+    //   only_if_absent — leave value untouched on key match; only act if
+    //                    the matched node is a routing node (reactivate)
+    //                    or the descent reaches an empty slot
+    enum class insert_policy : std::uint8_t { overwrite, only_if_absent };
 
     // -----------------------------------------------------------------
     // Lookup descent (recursive — depth bounded by tree height, which
@@ -507,6 +557,49 @@ private:
         }
     }
 
+    // attempt_get's twin for get(): same validating descent, but on
+    // key match takes n's lock briefly to copy the value out before
+    // returning. The lock guards against a concurrent overwrite of
+    // n->value tearing a non-trivial type mid-read.
+    [[nodiscard]] status attempt_get_value(node* parent, ovl_t pv, node* n,
+                                            const Key& key,
+                                            std::optional<Value>& out) const {
+        while (true) {
+            if (parent && parent->changeOVL.load(std::memory_order_acquire) != pv) {
+                return status::retry;
+            }
+            if (!n) return status::not_found;
+
+            const ovl_t nv = n->changeOVL.load(std::memory_order_acquire);
+            if (detail::cavl::ovl_is_unlinked(nv)) return status::retry;
+            if (detail::cavl::ovl_is_changing(nv)) {
+                std::this_thread::yield();
+                continue;
+            }
+
+            if (!(key < n->key) && !(n->key < key)) {
+                std::scoped_lock lk{n->lock};
+                if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                    return status::retry;
+                }
+                if (n->is_routing.load(std::memory_order_acquire)) {
+                    return status::not_found;
+                }
+                out.emplace(n->value);
+                return status::found;
+            }
+            const dir d = (key < n->key) ? dir::left : dir::right;
+
+            node* c = n->child(d).load(std::memory_order_acquire);
+            if (n->changeOVL.load(std::memory_order_acquire) != nv) {
+                return status::retry;
+            }
+            parent = n;
+            pv = nv;
+            n = c;
+        }
+    }
+
     // -----------------------------------------------------------------
     // Insert descent.
     //
@@ -515,12 +608,32 @@ private:
     // node. If the key matches mid-descent, overwrites the value
     // under that node's lock.
     // -----------------------------------------------------------------
+    // Common entry point for all four insert flavours. Loops over
+    // attempt_insert until a non-retry status is returned, then maps
+    // it to "did we add a new live entry?" for the try_* callers.
+    template <insert_policy Policy>
+    bool do_insert(Key key, Value value) {
+        detail::cavl::ebr::guard g;
+        while (true) {
+            const ovl_t holder_ovl = holder_.changeOVL.load(std::memory_order_acquire);
+            node* root = holder_.right.load(std::memory_order_acquire);
+            const auto r = attempt_insert<Policy>(&holder_, holder_ovl, root, key, value);
+            if (r == status::retry) continue;
+            return r == status::inserted;
+        }
+    }
+
     // Bronson insert descent. Mirrors attempt_get's parent-OVL
     // validation: every edge we follow is validated before we trust
     // the child. The publish step takes the parent's lock and
     // re-validates parent.OVL against the captured nv2 once more,
     // to catch a rotation that happened between the descent and the
     // lock acquisition.
+    //
+    // Policy controls the key-match branch: overwrite always assigns;
+    // only_if_absent only acts when the matched node is routing
+    // (reactivation counts as inserting a new live key).
+    template <insert_policy Policy>
     [[nodiscard]] status attempt_insert(node* parent, ovl_t pv, node* n,
                                         const Key& key, Value& value) {
         // The direction we descended from `parent` to reach `n`. For the
@@ -575,22 +688,29 @@ private:
             if (!(key < n->key) && !(n->key < key)) {
                 // Key match. Two sub-cases:
                 //   (a) n is a routing node (logically removed by a
-                //       prior remove()): REACTIVATE it. Set the new
-                //       value, clear is_routing, bump size, return
-                //       inserted (logically a new key in the set).
-                //   (b) n is live: overwrite the value, no size change,
-                //       return inserted (Bronson's status code; from
-                //       the user's point of view "already present").
+                //       prior remove()): REACTIVATE it under both
+                //       policies — the user is adding a key that's
+                //       not in the live set.
+                //   (b) n is live:
+                //         overwrite     — assign value, size unchanged
+                //         only_if_absent — leave alone, return not_inserted
                 std::scoped_lock lk{n->lock};
                 if (n->changeOVL.load(std::memory_order_acquire) != nv) {
                     return status::retry;
                 }
-                n->value = std::move(value);
-                if (n->is_routing.load(std::memory_order_acquire)) {
+                const bool routing = n->is_routing.load(std::memory_order_acquire);
+                if (routing) {
+                    n->value = std::move(value);
                     n->is_routing.store(false, std::memory_order_release);
                     size_.fetch_add(1, std::memory_order_relaxed);
+                    return status::inserted;
                 }
-                return status::inserted;
+                if constexpr (Policy == insert_policy::overwrite) {
+                    n->value = std::move(value);
+                    return status::inserted;
+                } else {
+                    return status::not_inserted;
+                }
             }
 
             const dir d = (key < n->key) ? dir::left : dir::right;
@@ -602,15 +722,17 @@ private:
             // Opportunistic pending-rebalance pickup. If n has been
             // flagged by a prior ascent that couldn't finish its
             // rotation, process it before continuing the descent.
-            // The flag and the processing both go through atomic
-            // load + per-node lock, so this is safe and idempotent.
-            // We pass on it if it costs us correctness (process may
-            // rotate n, after which our descent's parent_ovl is
-            // stale) — return retry in that case so the descent
-            // restarts cleanly.
+            // Only retry from root if the processing actually rotated
+            // n (in which case our descent's `c` is stale). If the
+            // flag was already stale or the rebalance couldn't
+            // converge, continue the descent we already validated
+            // above — retrying unconditionally would livelock pure
+            // read/skip operations (e.g. try_insert hitting a live
+            // key) that never run their own ascent to clear the flag.
             if (n->needs_rebalance.load(std::memory_order_acquire)) {
-                process_pending_if_set(n);
-                return status::retry;
+                if (process_pending_if_set(n) == pending_result::rotated) {
+                    return status::retry;
+                }
             }
 
             // Descend.
@@ -782,43 +904,58 @@ private:
         }
     }
 
+    // Result of an in-descent pending-rebalance pickup. Tells the
+    // caller whether the tree structure under `n` actually changed
+    // (descent context invalidated → caller must retry from root)
+    // or not (safe to continue the current descent).
+    enum class pending_result : std::uint8_t {
+        unchanged,   // flag was stale OR rebalance attempts couldn't converge
+        rotated,     // structure was modified; descent context is stale
+    };
+
     // Inline helper used by attempt_insert's descent: if `n` has its
-    // needs_rebalance flag set, drop our descent context, rebalance
-    // n in place, and let the caller restart from root. This catches
-    // off-path imbalances left behind by prior ascents that lost
-    // their rotation races. We don't process pendings encountered in
-    // contains() — readers don't mutate the structure.
-    void process_pending_if_set(node* n) {
-        if (n && n->needs_rebalance.load(std::memory_order_acquire)) {
-            // Try a tighter retry on this single node. The general
-            // ascent's max_retries is fine here too.
-            constexpr int max_retries = 8;
-            for (int attempt = 0; attempt < max_retries; ++attempt) {
-                std::int32_t bf = 0;
-                {
-                    std::scoped_lock nl{n->lock};
-                    if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
-                        return;
-                    }
-                    const auto hl = height_of(n->left.load(std::memory_order_acquire));
-                    const auto hr = height_of(n->right.load(std::memory_order_acquire));
-                    n->height.store(1 + std::max(hl, hr), std::memory_order_release);
-                    bf = hr - hl;
-                }
-                if (bf <= 1 && bf >= -1) {
-                    n->needs_rebalance.store(false, std::memory_order_release);
-                    return;
-                }
-                const bool rotated = (bf > 1) ? try_right_heavy_rotate(n)
-                                              : try_left_heavy_rotate(n);
-                if (rotated) {
-                    n->needs_rebalance.store(false, std::memory_order_release);
-                    return;
-                }
-                std::this_thread::yield();
-            }
-            // Still unbalanced; leave flag set for the next op.
+    // needs_rebalance flag set, attempt to rebalance n in place.
+    //
+    // Crucially, we do NOT force the caller to retry when the flag was
+    // stale (already balanced) or when 8 attempts couldn't converge.
+    // Without that distinction, an operation that doesn't mutate the
+    // tree (e.g. try_insert hitting a live key) livelocks: every
+    // descent through a flagged node would return retry, and because
+    // no ascent runs to clear the flag the next descent hits the
+    // same flag again. Returning `unchanged` lets the descent
+    // continue — the flag eventually gets cleared by some op that
+    // does run an ascent through here.
+    [[nodiscard]] pending_result process_pending_if_set(node* n) {
+        if (!n || !n->needs_rebalance.load(std::memory_order_acquire)) {
+            return pending_result::unchanged;
         }
+        constexpr int max_retries = 8;
+        for (int attempt = 0; attempt < max_retries; ++attempt) {
+            std::int32_t bf = 0;
+            {
+                std::scoped_lock nl{n->lock};
+                if (detail::cavl::ovl_is_unlinked(n->changeOVL.load(std::memory_order_acquire))) {
+                    return pending_result::unchanged;
+                }
+                const auto hl = height_of(n->left.load(std::memory_order_acquire));
+                const auto hr = height_of(n->right.load(std::memory_order_acquire));
+                n->height.store(1 + std::max(hl, hr), std::memory_order_release);
+                bf = hr - hl;
+            }
+            if (bf <= 1 && bf >= -1) {
+                n->needs_rebalance.store(false, std::memory_order_release);
+                return pending_result::unchanged;
+            }
+            const bool rotated = (bf > 1) ? try_right_heavy_rotate(n)
+                                          : try_left_heavy_rotate(n);
+            if (rotated) {
+                n->needs_rebalance.store(false, std::memory_order_release);
+                return pending_result::rotated;
+            }
+            std::this_thread::yield();
+        }
+        // Couldn't converge — leave flag set for the next op.
+        return pending_result::unchanged;
     }
 
     // Lock-free verification: scan from `start` to the holder and
