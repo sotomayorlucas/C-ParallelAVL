@@ -42,12 +42,13 @@ HEADERS = $(INC_DIR)/common.hpp \
           $(INC_DIR)/concurrent_avl.hpp
 
 BENCHMARK     = benchmark_parallel$(EXE)
+BENCH_CVSP    = benchmark_concurrent_vs_parallel$(EXE)
 TEST          = test_avl$(EXE)
 TEST_CAVL     = test_concurrent_avl$(EXE)
 COMPILER_CMP  = compiler_compare$(EXE)
 STRESS        = stress_test$(EXE)
 
-.PHONY: all clean debug release test test-cavl benchmark stress compare help
+.PHONY: all clean debug release test test-cavl benchmark bench-cvsp stress compare help
 
 all: release
 
@@ -59,6 +60,9 @@ debug: LDFLAGS += -fsanitize=address,undefined
 debug: $(BENCHMARK) $(TEST)
 
 $(BENCHMARK): $(BENCH_DIR)/benchmark_parallel.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+$(BENCH_CVSP): $(BENCH_DIR)/benchmark_concurrent_vs_parallel.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 $(TEST): $(TEST_DIR)/test_avl.cpp $(HEADERS)
@@ -76,6 +80,10 @@ $(STRESS): $(BENCH_DIR)/stress_test.cpp $(HEADERS)
 benchmark: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
 benchmark: $(BENCHMARK)
 	./$(BENCHMARK)
+
+bench-cvsp: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
+bench-cvsp: $(BENCH_CVSP)
+	./$(BENCH_CVSP)
 
 test: CXXFLAGS = $(CXXFLAGS_BASE) $(CXXFLAGS_OPT)
 test: $(TEST) $(TEST_CAVL)
@@ -103,7 +111,7 @@ ifeq ($(PLATFORM),windows)
 	@if exist $(STRESS) $(RM) $(STRESS)
 else
 	$(RMDIR) $(BUILD_DIR)
-	$(RM) $(BENCHMARK) $(TEST) $(TEST_CAVL) $(COMPILER_CMP) $(STRESS)
+	$(RM) $(BENCHMARK) $(BENCH_CVSP) $(TEST) $(TEST_CAVL) $(COMPILER_CMP) $(STRESS)
 endif
 
 help:
@@ -114,6 +122,7 @@ help:
 	@echo "  make debug          - Build with ASan + UBSan"
 	@echo "  make test           - Build and run unit tests"
 	@echo "  make benchmark      - Build and run benchmark"
+	@echo "  make bench-cvsp     - Build and run concurrent_avl vs parallel_avl benchmark"
 	@echo "  make stress         - Build and run stress test"
 	@echo "  make compare        - Build and run compiler comparison"
 	@echo "  make clean          - Remove build artifacts"
