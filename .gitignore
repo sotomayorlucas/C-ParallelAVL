@@ -1,9 +1,6 @@
 build/
-flowshield/bin/
 *.o
 *.a
-benchmark_parallel
-test_avl
-stress_test
-compiler_compare
+benchmark_concurrent_avl
+test_concurrent_avl
 *.exe

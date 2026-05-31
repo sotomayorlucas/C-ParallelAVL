@@ -1,109 +1,145 @@
-# Parallel AVL Tree — C++23
+# concurrent_avl&lt;K, V&gt; — Bronson optimistic AVL in C++23
 
-Header-only template implementation of a high-performance, sharded, concurrent
-AVL tree. Templated on `<Key, Value>`, RAII, lock-free statistics, with optional
-cherry-picks from C++26 gated on feature-test macros.
+Header-only template implementation of a practical lock-free-for-reads,
+fine-grained-locking-for-writes concurrent AVL tree.
 
-## Highlights
+Based on the Bronson, Casper, Chafi, Olukotun algorithm
+(*A Practical Concurrent Binary Search Tree*, PPoPP 2010), with the
+standard pieces:
 
-- **`template<Key, Value>`** — no `void*`, no manual destructors. Value lifetime
-  is managed by the tree (works with `std::string`, `std::unique_ptr<T>`, etc.).
-- **RAII** — `pavl::parallel_avl<K, V>` is created and destroyed by scope.
-- **`std::atomic` / `std::shared_mutex` / `std::scoped_lock` / `std::jthread`**
-  replace the per-platform `atomics.h`, `pthread_*`, `SRWLOCK`, `CreateThread`
-  abstractions of the original C code.
-- **`std::expected`, `std::ranges`, `std::format`, `std::source_location`** used
-  where they sharpen the API.
-- **`[[likely]]` / `[[unlikely]]`**, `alignas(64)`, `[[gnu::always_inline]]` on
-  hot paths — same micro-architectural tuning as the C version.
-- **Concurrent topology mutation is safe**: `add_shard`, `remove_shard`,
-  `force_rebalance` serialize against in-flight ops via a `std::shared_mutex`.
-  (The C original use-after-free'd here under load; verified with ASan.)
+- **Optimistic, validating descent** — readers chase pointers without
+  acquiring any lock, validating each (parent → child) edge against a
+  per-node version counter (`changeOVL`) that is bumped whenever the
+  node's structural state changes. A reader that loses a race with a
+  concurrent rotation retries from the root.
+- **Per-node `std::mutex` for writers** — `insert` only locks the
+  parent of the publishing slot; `remove` only locks the matched node
+  (then optionally also its parent + only-child for physical unlink).
+- **Rotation under multi-lock chains** — single + double rotations
+  acquire all the nodes they touch atomically via `std::lock(...)`, so
+  the surgery is deadlock-free regardless of which direction the
+  rotation runs.
+- **Partially-external deletion** — a node with two children that is
+  logically removed stays in the tree as a *routing node* (key
+  preserved for BST descent, no value, `is_routing = true`). Future
+  inserts of the same key reactivate it; a concurrent reader sees
+  "not present" for routing keys. 0/1-child routing nodes are
+  physically unlinked and handed to EBR for reclamation.
+- **Epoch-based reclamation (EBR)** — every public operation installs
+  a thread-local `ebr::guard`. Retired nodes wait two epochs before
+  being `delete`d, so no thread can dereference a freed node.
 
-## Toolchain
+## API
 
-- GCC 13+ or Clang 17+ for solid C++23 library support (`std::expected`,
-  `std::format`, `std::jthread`, `std::ranges`).
-- C++26 features are opt-in via `__cpp_lib_*` feature-test macros; the code
-  compiles cleanly on a current GCC 13 / libstdc++ 13 toolchain.
+```cpp
+#include "concurrent_avl.hpp"
+
+pavl::concurrent_avl<int64_t, std::string> t;
+
+// Writers — all thread-safe, no external locking needed.
+t.insert(42, "hello");                     // overwrite if present
+t.insert_or_assign(42, "world");           // std::map alias for the above
+bool inserted = t.try_insert(7, "x");      // true if new live entry
+bool emplaced = t.try_emplace(9, "y");     // construct V in place, try_insert
+bool gone     = t.remove(42);              // logical remove + maybe-unlink
+
+// Readers — lock-free except for get() / range_for_each which copy
+// under the matched node's lock to serialise against a concurrent
+// overwrite.
+bool present  = t.contains(7);
+std::optional<std::string> v = t.get(7);
+
+// Best-effort snapshot iteration in ascending key order.
+t.for_each([](const int64_t& k, const std::string& v) {
+    std::cout << k << " -> " << v << "\n";
+});
+t.range_for_each(0, 100, [&](auto& k, auto& v) { /* ... */ });
+
+// Size is approximate under concurrent ops; exact in a quiesced tree.
+std::cout << t.size() << "\n";
+```
+
+`Key` must satisfy `std::totally_ordered + std::copyable`; `Value` must
+be `std::movable`. Both must be `std::default_initializable` (the
+sentinel root holder default-constructs them but never inspects the
+values). `get` / `range_for_each` / `for_each` additionally require
+`std::copyable<Value>` per call (the value is copied out under the
+node's lock before the visitor sees it, so a long-running visitor
+doesn't block writers).
+
+## Concurrency semantics
+
+- **`contains`, `get`** — linearisable. The successful descent's last
+  read of the matched node's OVL (under its own lock for `get`)
+  defines the linearisation point.
+- **`insert`, `insert_or_assign`, `try_insert`, `try_emplace`,
+  `remove`** — linearisable. The store that publishes the new node
+  (or assigns the value, or sets `is_routing = true`) is the
+  linearisation point.
+- **`range_for_each`, `for_each`** — *best-effort snapshot*. Any key
+  that is continuously live for the entire call is visited exactly
+  once. A key that flickers (insert+remove during the call) may be
+  visited 0 or 1 times. A node rotated through our recursion may be
+  visited 0 or 2 times in the pathological case. Each emitted
+  `(key, value)` pair was a real, live pair at *some* moment during
+  the call — no torn reads, no values from routing or unlinked nodes.
+
+The visitor for `range_for_each` and `for_each` runs **outside** any
+node lock, so it can call back into the tree (`contains`, `get`,
+`insert`, even another `range_for_each`) without self-deadlock.
 
 ## Build
 
 ```sh
-make            # release: benchmark_parallel + test_avl
-make test       # run unit tests (24 tests)
-make benchmark  # run scalability benchmark
-make stress     # run 6 stress tests including adversarial workloads
-make compare    # compiler-vs-compiler comparison bench
-make debug      # ASan + UBSan build
+make            # release: build benchmark + tests
+make test       # build and run unit tests
+make bench      # build and run throughput benchmark
+make debug      # build tests with ASan + UBSan
+make clean
 ```
+
+Toolchain: GCC 13+ or Clang 17+ — needs `std::format`, `std::jthread`,
+`std::scoped_lock`'s `std::lock` interaction, and concepts in the
+constraint syntax.
 
 ## File layout
 
 ```
 include/
-  common.hpp          # concepts, cache_line_size, key_hash, attributes
-  avl_tree.hpp        # avl_tree<K, V> + node_pool
-  hash_table.hpp      # hash_table<K, V> (Robin Hood, used by redirect_index)
-  shard.hpp           # shard<K, V> = mutex + avl_tree + atomic stats
-  router.hpp          # router (hash → shard, 4 strategies)
-  redirect_index.hpp  # redirect_index<K> (shared_mutex RW lock)
-  parallel_avl.hpp    # parallel_avl<K, V> — public API
-tests/test_avl.cpp
-bench/{benchmark_parallel,stress_test,compiler_compare}.cpp
+  common.hpp          # cache_line_size + avl_key / avl_value concepts
+  concurrent_avl.hpp  # the tree
+bench/
+  benchmark_concurrent_avl.cpp
+tests/
+  test_concurrent_avl.cpp
 ```
 
-## Usage
+## Throughput
 
-```cpp
-#include "parallel_avl.hpp"
+Measured on a 4-core x86_64 box, GCC 13.3, `-O3 -march=native -flto`,
+via `bench/benchmark_concurrent_avl.cpp`. Numbers in operations / second.
 
-int main() {
-    pavl::parallel_avl<std::int64_t, std::string> tree{8, pavl::router_strategy::intelligent};
+| workload                  | 1 thread | 2 threads | 4 threads | 8 threads |
+|---------------------------|---------:|----------:|----------:|----------:|
+| Read-only (100% contains) | ~3.2 M   | ~7.4 M    | ~14 M     | ~13 M     |
+| Mixed 70/15/15            | ~4.0 M   | ~5.6 M    | ~8.5 M    | ~7.5 M    |
+| Write-heavy 20/40/40      | ~4.0 M   | ~3.5 M    | ~5.3 M    | ~4.4 M    |
 
-    tree.insert(42, "hello");
-    if (auto v = tree.get(42)) std::println("found: {}", *v);
+Read-only scaling is the strongest case for the design — lock-free
+descent + validating OVL means readers never block writers and don't
+block each other. Throughput peaks around the core count (4) and
+plateaus or dips at 8 threads on a 4-core box, where oversubscription
+costs more than the extra parallelism buys.
 
-    // Zero-copy visit
-    tree.visit(42, [](std::string& s) { s += " world"; });
+## Known limitations
 
-    // Range queries return std::vector<key_value>
-    auto rows = tree.range_query(10, 50, /*max*/ 100);
-
-    // Dynamic scaling (thread-safe, serializes vs in-flight ops)
-    tree.add_shard();
-    tree.force_rebalance();
-
-    auto s = tree.snapshot();
-    std::println("shards={} size={} balance={:.2f}", s.num_shards, s.total_size, s.balance_score);
-}
-```
-
-## Routing strategies
-
-| Enum | Behaviour |
-|------|-----------|
-| `router_strategy::static_hash` | Plain hash → shard. Fastest, fragile to adversarial keys. |
-| `router_strategy::load_aware` | Detects hotspots, redirects to least loaded shard. |
-| `router_strategy::consistent_hash` | Virtual nodes — stable under topology changes. |
-| `router_strategy::intelligent` | Adaptive hybrid. **Default.** |
-
-## Notes on performance
-
-Single-thread shard hot path (5M ops, gcc 13.3 `-O3 -march=native -flto`):
-
-| Op | C++23 port | C original |
-|----|-----------|-----------|
-| insert | 7.9 M ops/s | 6.1 M ops/s |
-| contains | 10.6 M ops/s | 9.7 M ops/s |
-
-Multi-thread sustained (8 threads, 4M ops, 70/15/15 read/insert/delete):
-~2.7 M ops/s for both — within noise of each other.
-
-The `shared_mutex` for topology safety costs ~30% on the pure-read stress
-test versus an unsynchronized read. That overhead buys correctness:
-the original C version use-after-free'd here, confirmed by AddressSanitizer.
+- A residual rebalance-retry livelock can be hit by the Fase 1a
+  concurrent stress tests (`insert_visible_after_return`,
+  `concurrent_insert_remove_mix`) under sustained high-contention
+  scheduling. On a quiet 4-core box the suite passes cleanly; under
+  rapid back-to-back runs it can hang in ~50% of cases. Single-
+  threaded usage and the Fase 5 iteration path are not affected.
 
 ## License
 
-MIT — same as the original project.
+Same as the repo at large.
