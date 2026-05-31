@@ -1,10 +1,6 @@
 build/
 *.o
 *.a
-benchmark_parallel
-benchmark_concurrent_vs_parallel
-test_avl
+benchmark_concurrent_avl
 test_concurrent_avl
-stress_test
-compiler_compare
 *.exe

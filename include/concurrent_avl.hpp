@@ -1206,9 +1206,9 @@ private:
     // Single rotate-left under all relevant locks held by caller.
     //
     //      n                y
-    //     / \              / \
+    //     / .              / .
     //    A   y     ->     n   C
-    //       / \          / \
+    //       / .          / .
     //      B   C        A   B
     void do_rotate_left_under_locks(node* p, node* n, node* y) {
         node* B = y->left.load(std::memory_order_acquire);
