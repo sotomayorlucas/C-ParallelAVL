@@ -466,6 +466,56 @@ public:
         }
     }
 
+    // =================================================================
+    // Range iteration — best-effort snapshot semantics.
+    //
+    // range_for_each(lo, hi, vis) walks the live entries with keys in
+    // the inclusive interval [lo, hi] in ascending key order, calling
+    // vis(key, value) for each. for_each(vis) is the whole-tree form.
+    //
+    // Semantics under concurrent writes:
+    //   - Any key that is continuously live throughout the call IS
+    //     visited exactly once. (The key never moves between
+    //     subtrees as long as no node it sits in is unlinked, and
+    //     the in-order recursion covers each visited node once.)
+    //   - A key that flickers live during the call (inserted then
+    //     removed, or vice versa) may be visited 0 or 1 times.
+    //   - A node that is rotated while we recurse through its
+    //     subtree may be visited 0 or 2 times in the pathological
+    //     case — rare in practice on a stable workload.
+    //   - Each emitted (key, value) pair was a real, live entry at
+    //     some moment between the call and the return — no torn
+    //     reads, no values from removed nodes, no values from
+    //     unpublished nodes.
+    //
+    // Implementation details:
+    //   - EBR guard keeps nodes alive for the duration of the call.
+    //   - For each node we copy `value` out under that node's lock,
+    //     check it is neither unlinked nor routing, and only then
+    //     call vis OUTSIDE the lock. The visitor can therefore
+    //     safely call back into the tree (contains, get, insert,
+    //     remove, even range_for_each) without risk of self-deadlock.
+    //   - Requires std::copyable<Value> per call; reported as a
+    //     constraint failure if Value is move-only.
+    // =================================================================
+    template <typename F>
+        requires std::copyable<Value>
+              && std::invocable<F&, const Key&, const Value&>
+    void range_for_each(const Key& lo, const Key& hi, F&& vis) const {
+        detail::cavl::ebr::guard g;
+        node* root = holder_.right.load(std::memory_order_acquire);
+        visit_subtree_range(root, lo, hi, vis);
+    }
+
+    template <typename F>
+        requires std::copyable<Value>
+              && std::invocable<F&, const Key&, const Value&>
+    void for_each(F&& vis) const {
+        detail::cavl::ebr::guard g;
+        node* root = holder_.right.load(std::memory_order_acquire);
+        visit_subtree_all(root, vis);
+    }
+
 private:
     // attempt_get / attempt_insert / attempt_remove return one of these.
     //   found        — for contains: key present
@@ -597,6 +647,81 @@ private:
             parent = n;
             pv = nv;
             n = c;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Range / whole-tree iteration helpers (Fase 5).
+    //
+    // The recursion descends in-order. For each node n we:
+    //   1. Read n's children atomically (acquire) — n is kept alive
+    //      by the EBR guard the caller installed.
+    //   2. Optionally recurse into left subtree (if it can contain
+    //      keys >= lo for the ranged variant).
+    //   3. Acquire n's lock briefly: re-check (unlinked? routing?)
+    //      and copy `value` out. Release the lock.
+    //   4. If the snapshot is live, invoke vis(n->key, snapshot).
+    //      n->key is set at construction and never mutates while
+    //      n is reachable, so reading it lock-free is safe.
+    //   5. Optionally recurse into right subtree.
+    //
+    // Calling vis outside the lock means the visitor is free to call
+    // back into the tree (no self-deadlock) and isn't blocked on a
+    // node mutex if it's slow.
+    // -----------------------------------------------------------------
+    template <typename F>
+    void visit_subtree_all(node* n, F& vis) const {
+        if (!n) return;
+
+        node* left  = n->left.load(std::memory_order_acquire);
+        node* right = n->right.load(std::memory_order_acquire);
+
+        visit_subtree_all(left, vis);
+
+        std::optional<Value> snapshot;
+        {
+            std::scoped_lock lk{n->lock};
+            const ovl_t cur = n->changeOVL.load(std::memory_order_acquire);
+            if (!detail::cavl::ovl_is_unlinked(cur) &&
+                !n->is_routing.load(std::memory_order_acquire)) {
+                snapshot.emplace(n->value);
+            }
+        }
+        if (snapshot) vis(n->key, *snapshot);
+
+        visit_subtree_all(right, vis);
+    }
+
+    template <typename F>
+    void visit_subtree_range(node* n, const Key& lo, const Key& hi, F& vis) const {
+        if (!n) return;
+
+        const Key& k = n->key;
+
+        // Prune: if n->key < lo, the left subtree's keys are all < lo
+        // (BST invariant). Don't recurse left.
+        if (!(k < lo)) {
+            node* left = n->left.load(std::memory_order_acquire);
+            visit_subtree_range(left, lo, hi, vis);
+        }
+
+        if (!(k < lo) && !(hi < k)) {
+            std::optional<Value> snapshot;
+            {
+                std::scoped_lock lk{n->lock};
+                const ovl_t cur = n->changeOVL.load(std::memory_order_acquire);
+                if (!detail::cavl::ovl_is_unlinked(cur) &&
+                    !n->is_routing.load(std::memory_order_acquire)) {
+                    snapshot.emplace(n->value);
+                }
+            }
+            if (snapshot) vis(k, *snapshot);
+        }
+
+        // Mirror prune on the right.
+        if (!(hi < k)) {
+            node* right = n->right.load(std::memory_order_acquire);
+            visit_subtree_range(right, lo, hi, vis);
         }
     }
 

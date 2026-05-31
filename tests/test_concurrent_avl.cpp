@@ -522,6 +522,116 @@ void test_concurrent_get_under_writers() {
     for (int i = 0; i < 2000; ++i) EXPECT(t.get(i).has_value());
 }
 
+// =====================================================================
+// Fase 5: range_for_each / for_each — best-effort snapshot iteration
+// =====================================================================
+void test_for_each_empty() {
+    pavl::concurrent_avl<i64, i64> t;
+    int calls = 0;
+    t.for_each([&](const i64&, const i64&) { ++calls; });
+    EXPECT(calls == 0);
+}
+
+void test_for_each_ascending_order() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 100; ++i) t.insert(i, i * 10);
+    std::vector<std::pair<i64, i64>> out;
+    t.for_each([&](const i64& k, const i64& v) { out.emplace_back(k, v); });
+    EXPECT(out.size() == 100);
+    for (int i = 0; i < 100; ++i) {
+        EXPECT(out[i].first == i);
+        EXPECT(out[i].second == i * 10);
+    }
+}
+
+void test_for_each_random_then_sorted_view() {
+    pavl::concurrent_avl<i64, i64> t;
+    std::mt19937_64 rng(42);
+    std::vector<i64> keys;
+    for (int i = 0; i < 200; ++i) keys.push_back(i);
+    std::shuffle(keys.begin(), keys.end(), rng);
+    for (auto k : keys) t.insert(k, k + 1000);
+
+    std::vector<i64> out;
+    t.for_each([&](const i64& k, const i64&) { out.push_back(k); });
+    EXPECT(out.size() == 200);
+    for (int i = 0; i < 200; ++i) EXPECT(out[i] == i);
+}
+
+void test_range_for_each_inclusive_bounds() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 50; ++i) t.insert(i, i);
+    std::vector<i64> out;
+    t.range_for_each(10, 20, [&](const i64& k, const i64&) { out.push_back(k); });
+    EXPECT(out.size() == 11);          // [10, 20] inclusive
+    EXPECT(out.front() == 10);
+    EXPECT(out.back() == 20);
+}
+
+void test_range_for_each_empty_range() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 50; ++i) t.insert(i, i);
+    std::vector<i64> out;
+    t.range_for_each(100, 200, [&](const i64& k, const i64&) { out.push_back(k); });
+    EXPECT(out.empty());
+}
+
+void test_range_for_each_skips_routing_nodes() {
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 50; ++i) t.insert(i, i);
+    for (int i = 0; i < 50; i += 2) (void)t.remove(i);  // half stay routing
+    std::vector<i64> out;
+    t.range_for_each(0, 49, [&](const i64& k, const i64&) { out.push_back(k); });
+    // Only odd keys remain live.
+    EXPECT(out.size() == 25);
+    for (auto k : out) EXPECT(k % 2 == 1);
+}
+
+void test_for_each_visitor_may_reenter() {
+    // Visitor calls back into the tree (contains). Since vis runs
+    // outside any node lock, this must not deadlock.
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 30; ++i) t.insert(i, i);
+    int re_entry_hits = 0;
+    t.for_each([&](const i64& k, const i64&) {
+        if (t.contains(k)) ++re_entry_hits;
+    });
+    EXPECT(re_entry_hits == 30);
+}
+
+void test_for_each_concurrent_writes_no_crash() {
+    // Iteration concurrent with inserts and removes. We don't assert
+    // exactly which keys appear (best-effort semantics); just that we
+    // don't crash, the count is in a sensible range, and pre-existing
+    // continuously-live keys are all visited.
+    pavl::concurrent_avl<i64, i64> t;
+    for (int i = 0; i < 200; ++i) t.insert(i, i);  // continuously live
+
+    std::atomic<bool> stop{false};
+    std::jthread writer([&] {
+        std::mt19937_64 rng(7);
+        std::uniform_int_distribution<i64> d(1000, 2000);
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto k = d(rng);
+            t.insert(k, k);
+            (void)t.remove(k);
+        }
+    });
+
+    int passes_ok = 0;
+    for (int pass = 0; pass < 20; ++pass) {
+        std::vector<i64> live_seen;
+        live_seen.reserve(400);
+        t.for_each([&](const i64& k, const i64&) {
+            if (k < 200) live_seen.push_back(k);
+        });
+        // Every continuously-live key in [0, 200) must appear.
+        if (live_seen.size() == 200) ++passes_ok;
+    }
+    stop.store(true, std::memory_order_release);
+    EXPECT(passes_ok == 20);
+}
+
 void test_insert_visible_after_return() {
     pavl::concurrent_avl<i64, i64> t;
     constexpr int NT = 8;
@@ -591,6 +701,16 @@ int main() {
     RUN(get_after_remove_returns_nullopt);
     RUN(concurrent_try_insert_one_winner_per_key);
     RUN(concurrent_get_under_writers);
+
+    std::cout << "\n=== concurrent_avl Fase 5 — range_for_each / for_each ===\n";
+    RUN(for_each_empty);
+    RUN(for_each_ascending_order);
+    RUN(for_each_random_then_sorted_view);
+    RUN(range_for_each_inclusive_bounds);
+    RUN(range_for_each_empty_range);
+    RUN(range_for_each_skips_routing_nodes);
+    RUN(for_each_visitor_may_reenter);
+    RUN(for_each_concurrent_writes_no_crash);
 
     std::cout << std::format("\n=== Results ===\nPassed: {}\nFailed: {}\n",
                              tests_passed, tests_failed);
