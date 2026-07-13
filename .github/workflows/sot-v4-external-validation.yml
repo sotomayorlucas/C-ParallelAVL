@@ -37,12 +37,13 @@ jobs:
         env:
           TGB_VERBOSE: "True"
         run: |
+          set -o pipefail
           mkdir -p validation/sot_v4/out
           python validation/sot_v4/tgb_validation.py \
             --out-dir validation/sot_v4/out \
             --eval-queries 1200 \
             --cover-witnesses 128 \
-            | tee validation/sot_v4/out/tgb-run.log
+            2>&1 | tee validation/sot_v4/out/tgb-run.log
           cp validation/sot_v4/out/tgb_results.json "$RUNNER_TEMP/sot-v4-staging/"
           cp validation/sot_v4/out/tgb-run.log "$RUNNER_TEMP/sot-v4-staging/"
           sha256sum validation/sot_v4/out/tgbl_uci_edges.tsv > "$RUNNER_TEMP/sot-v4-staging/tgbl_uci_edges.tsv.sha256"
@@ -52,12 +53,13 @@ jobs:
 
       - name: Build and run Differential Dataflow 0.24.0
         run: |
+          set -o pipefail
           cargo run --release \
             --manifest-path validation/sot_v4/differential/Cargo.toml -- \
             validation/sot_v4/out/tgbl_uci_edges.tsv \
             validation/sot_v4/out/differential_results.json \
             30000 500 604800 \
-            | tee validation/sot_v4/out/differential-run.log
+            2>&1 | tee validation/sot_v4/out/differential-run.log
           rustc --version > validation/sot_v4/out/rust-toolchain.txt
           cargo --version >> validation/sot_v4/out/rust-toolchain.txt
           cp validation/sot_v4/out/differential_results.json "$RUNNER_TEMP/sot-v4-staging/"
@@ -65,7 +67,8 @@ jobs:
 
       - name: Cross-system acceptance gate
         run: |
-          python validation/sot_v4/verify_v4.py validation/sot_v4/out | tee validation/sot_v4/out/verify.log
+          set -o pipefail
+          python validation/sot_v4/verify_v4.py validation/sot_v4/out 2>&1 | tee validation/sot_v4/out/verify.log
           cp validation/sot_v4/out/v4_validation.json validation/sot_v4/out/verify.log "$RUNNER_TEMP/sot-v4-staging/"
 
       - name: Collect content-addressed evidence
@@ -78,6 +81,7 @@ jobs:
           mkdir -p validation/sot_v4/evidence/source/differential-src
           cp validation/sot_v4/differential/src/main.rs validation/sot_v4/evidence/source/differential-src/
           cp "$RUNNER_TEMP/sot-v4-staging"/* validation/sot_v4/evidence/results/ 2>/dev/null || true
+          cp validation/sot_v4/out/*.log validation/sot_v4/evidence/results/ 2>/dev/null || true
           ls -lah validation/sot_v4/out > validation/sot_v4/evidence/results/out-listing.txt 2>&1 || true
           ls -lah "$RUNNER_TEMP/sot-v4-staging" > validation/sot_v4/evidence/results/staging-listing.txt 2>&1 || true
           git rev-parse HEAD > validation/sot_v4/evidence/commit.txt
