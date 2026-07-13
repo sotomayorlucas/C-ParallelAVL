@@ -4,7 +4,7 @@ authors = ["Sufficient Observer Theory validation"]
 version = "0.1.0"
 
 [deps]
-JSON3 = "0f8b85d8-7281-11e9-16c2-39b4e7f1a5f9"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 POMDPTools = "7588e00f-9cae-40de-98dc-e0c70c48cdd7"
 POMDPs = "a93abf59-7444-517b-a68a-c42f96afdd7d"
 
