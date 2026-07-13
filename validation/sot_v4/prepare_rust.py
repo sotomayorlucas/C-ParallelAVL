@@ -21,13 +21,13 @@ needle = '''    timely::execute(timely::Config::thread(), move |worker| {
         let mut input = worker.dataflow(|scope| {
 '''
 replacement = '''    timely::execute(timely::Config::thread(), move |worker| {
-        let edge_state_data = edge_state_cb.clone();
-        let path_state_data = path_state_cb.clone();
-        let cycle_state_data = cycle_state_cb.clone();
-        let path_abs_data = path_abs_cb.clone();
-        let cycle_abs_data = cycle_abs_cb.clone();
         let mut probe = Handle::new();
-        let mut input = worker.dataflow(move |scope| {
+        let mut input = worker.dataflow(|scope| {
+            let edge_state_data = edge_state_cb.clone();
+            let path_state_data = path_state_cb.clone();
+            let cycle_state_data = cycle_state_cb.clone();
+            let path_abs_data = path_abs_cb.clone();
+            let cycle_abs_data = cycle_abs_cb.clone();
 '''
 if needle not in source:
     raise SystemExit("dataflow closure marker not found")
