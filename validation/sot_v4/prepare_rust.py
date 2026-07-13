@@ -44,6 +44,16 @@ for old, new in [
         raise SystemExit(f"callback marker not found: {old}")
     source = source.replace(old, new, 1)
 
+needle = '''            let two_paths = first_by_mid.join_map(edges.clone(), |_mid, u, w| (*w, *u));
+'''
+replacement = '''            let two_paths = first_by_mid
+                .join_map(edges.clone(), |_mid, u, w| (*w, *u))
+                .filter(|(w, u)| w != u);
+'''
+if needle not in source:
+    raise SystemExit("two-path filter marker not found")
+source = source.replace(needle, replacement, 1)
+
 needle = "        input_events_available: all_events.len(), input_events_processed: events.len(), window_seconds, batch_size,\n"
 replacement = "        input_events_available: all_events.len(), input_events_processed: events_len, window_seconds, batch_size,\n"
 if needle not in source:
