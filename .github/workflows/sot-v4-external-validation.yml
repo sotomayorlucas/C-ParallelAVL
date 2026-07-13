@@ -1,0 +1,76 @@
+name: SOT V4 external validation
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["sot-v4-external-validation"]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned TGB integration
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install py-tgb==2.2.0
+          python -m pip freeze | sort > validation/sot_v4/python-freeze.txt
+
+      - name: Run local algorithm self-test
+        run: python validation/sot_v4/tgb_validation.py --self-test
+
+      - name: Run official TGB validation
+        env:
+          TGB_VERBOSE: "True"
+        run: |
+          mkdir -p validation/sot_v4/out
+          python validation/sot_v4/tgb_validation.py \
+            --out-dir validation/sot_v4/out \
+            --eval-queries 1200 \
+            --cover-witnesses 128 \
+            | tee validation/sot_v4/out/tgb-run.log
+
+      - uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Build and run Differential Dataflow 0.24.0
+        run: |
+          cargo run --release \
+            --manifest-path validation/sot_v4/differential/Cargo.toml -- \
+            validation/sot_v4/out/tgbl_uci_edges.tsv \
+            validation/sot_v4/out/differential_results.json \
+            30000 500 604800 \
+            | tee validation/sot_v4/out/differential-run.log
+          rustc --version > validation/sot_v4/out/rust-toolchain.txt
+          cargo --version >> validation/sot_v4/out/rust-toolchain.txt
+
+      - name: Cross-system acceptance gate
+        run: python validation/sot_v4/verify_v4.py validation/sot_v4/out | tee validation/sot_v4/out/verify.log
+
+      - name: Collect content-addressed evidence
+        if: always()
+        run: |
+          mkdir -p validation/sot_v4/evidence
+          cp validation/sot_v4/tgb_validation.py validation/sot_v4/verify_v4.py validation/sot_v4/README.md validation/sot_v4/evidence/
+          cp -r validation/sot_v4/differential validation/sot_v4/evidence/
+          cp validation/sot_v4/python-freeze.txt validation/sot_v4/evidence/ 2>/dev/null || true
+          cp -r validation/sot_v4/out validation/sot_v4/evidence/ 2>/dev/null || true
+          git rev-parse HEAD > validation/sot_v4/evidence/commit.txt
+          find validation/sot_v4/evidence -type f ! -name MANIFEST.sha256 -print0 \
+            | sort -z | xargs -0 sha256sum > validation/sot_v4/evidence/MANIFEST.sha256
+
+      - name: Upload V4 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sot-v4-external-validation-evidence
+          path: validation/sot_v4/evidence
+          if-no-files-found: error
