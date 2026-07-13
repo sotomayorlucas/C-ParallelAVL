@@ -27,7 +27,7 @@ jobs:
         working-directory: validation/sot_v5
         run: |
           set -o pipefail
-          julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); Pkg.precompile(); Pkg.status()' 2>&1 | tee instantiate.log
+          julia --project=. -e 'using Pkg; isempty(Pkg.Registry.reachable_registries()) && Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate(); Pkg.precompile(); Pkg.status()' 2>&1 | tee instantiate.log
 
       - name: Run POMDPs.jl integration
         env:
