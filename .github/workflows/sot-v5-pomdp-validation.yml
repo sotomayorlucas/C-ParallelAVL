@@ -26,17 +26,21 @@ jobs:
       - name: Instantiate pinned Julia environment
         working-directory: validation/sot_v5
         run: |
-          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()' | tee instantiate.log
+          set -o pipefail
+          julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); Pkg.precompile(); Pkg.status()' 2>&1 | tee instantiate.log
 
       - name: Run POMDPs.jl integration
         env:
           SOT_V5_OUT: ${{ github.workspace }}/validation/sot_v5/out
         run: |
+          set -o pipefail
           mkdir -p validation/sot_v5/out
           julia --project=validation/sot_v5 validation/sot_v5/run.jl 2>&1 | tee validation/sot_v5/out/julia-run.log
 
       - name: Run independent exact checker
-        run: python3 validation/sot_v5/check.py validation/sot_v5/out/pomdps_results.json | tee validation/sot_v5/out/python-check.log
+        run: |
+          set -o pipefail
+          python3 validation/sot_v5/check.py validation/sot_v5/out/pomdps_results.json 2>&1 | tee validation/sot_v5/out/python-check.log
 
       - name: Reject hidden failures
         run: |
