@@ -166,20 +166,20 @@ fn main() {
             let (input, raw_edges) = scope.new_collection::<Edge, isize>();
             let edges = raw_edges.distinct();
             edges.clone().consolidate().inspect(move |x| {
-                let key = x.0; let diff = *x.2;
+                let key = x.0; let diff = x.2;
                 update_map(&mut edge_state_cb.lock().expect("edge state lock"), key, diff);
             });
             let first_by_mid = edges.clone().map(|(u, mid)| (mid, u));
             let two_paths = first_by_mid.join_map(edges.clone(), |_mid, u, w| (*w, *u));
             two_paths.clone().consolidate().inspect(move |x| {
-                let key = x.0; let diff = *x.2;
+                let key = x.0; let diff = x.2;
                 *path_abs_cb.lock().expect("path delta lock") += (diff as i64).abs();
                 update_map(&mut path_state_cb.lock().expect("path state lock"), key, diff);
             });
             let edge_keyed = edges.map(|e| (e, ()));
             let closed = two_paths.map(|p| (p, ())).join_map(edge_keyed, |_key, _path, _edge| ());
             closed.consolidate().inspect(move |x| {
-                let diff = *x.2 as i64;
+                let diff = x.2 as i64;
                 *cycle_abs_cb.lock().expect("cycle delta lock") += diff.abs();
                 *cycle_state_cb.lock().expect("cycle state lock") += diff;
             }).probe_with(&mut probe);
