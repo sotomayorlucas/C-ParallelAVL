@@ -56,6 +56,16 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def julia_matrix_rows(value, nrows: int) -> list[list[float]]:
+    """Decode JSON3's column-major flat encoding or a nested row encoding."""
+    if value and isinstance(value[0], list):
+        return value
+    if len(value) % nrows != 0:
+        raise ValueError(f"matrix payload of length {len(value)} is not divisible by {nrows}")
+    ncols = len(value)//nrows
+    return [[value[i+j*nrows] for j in range(ncols)] for i in range(nrows)]
+
+
 def main() -> None:
     path = Path(sys.argv[1] if len(sys.argv) > 1 else "validation/sot_v5/out/pomdps_results.json")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -80,8 +90,7 @@ def main() -> None:
     generic_rank = affine_rank(rows)
 
     # Exact quotient rank from class-constant test rows reported by Julia.
-    exact_rows_float = data["exact_predictive_quotient"]["test_matrix"]
-    # Rationalize the reported class-equal rows conservatively to 10^-12.
+    exact_rows_float = julia_matrix_rows(data["exact_predictive_quotient"]["test_matrix"], 4)
     exact_class_equal = (
         max(abs(exact_rows_float[0][j]-exact_rows_float[1][j]) for j in range(len(exact_rows_float[0]))) < 1e-12
         and max(abs(exact_rows_float[2][j]-exact_rows_float[3][j]) for j in range(len(exact_rows_float[0]))) < 1e-12
@@ -95,7 +104,7 @@ def main() -> None:
     checks = {
         "schema": data.get("schema") == "sot-v5-pomdps-1.0",
         "reported_all_pass": data.get("all_pass") is True,
-        "pompds_version": str(versions.get("POMDPs", "")).startswith("1.0"),
+        "pomdps_version": str(versions.get("POMDPs", "")).startswith("1.0"),
         "pomdptools_version": str(versions.get("POMDPTools", "")).startswith("1.1"),
         "julia_1_12": str(versions.get("Julia", "")).startswith("1.12"),
         "exact_rank_one": exact.get("predictive_affine_rank") == 1 and exact_class_equal,
