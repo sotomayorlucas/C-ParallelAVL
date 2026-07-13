@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Prepare V4 runtime source
-        run: python validation/sot_v4/prepare_v4.py
+        run: |
+          python validation/sot_v4/prepare_v4.py
+          python validation/sot_v4/prepare_rust.py
 
       - name: Initialize immutable staging area
         run: |
@@ -82,7 +84,7 @@ jobs:
         run: |
           rm -rf validation/sot_v4/evidence
           mkdir -p validation/sot_v4/evidence/source validation/sot_v4/evidence/results
-          cp validation/sot_v4/tgb_validation.py validation/sot_v4/verify_v4.py validation/sot_v4/prepare_v4.py validation/sot_v4/README.md validation/sot_v4/evidence/source/
+          cp validation/sot_v4/tgb_validation.py validation/sot_v4/verify_v4.py validation/sot_v4/prepare_v4.py validation/sot_v4/prepare_rust.py validation/sot_v4/README.md validation/sot_v4/evidence/source/
           cp validation/sot_v4/differential/Cargo.toml validation/sot_v4/differential/Cargo.lock validation/sot_v4/evidence/source/ 2>/dev/null || true
           mkdir -p validation/sot_v4/evidence/source/differential-src
           cp validation/sot_v4/differential/src/main.rs validation/sot_v4/evidence/source/differential-src/
