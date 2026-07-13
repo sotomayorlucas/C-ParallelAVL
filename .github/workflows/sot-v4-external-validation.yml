@@ -57,11 +57,21 @@ jobs:
       - name: Collect content-addressed evidence
         if: always()
         run: |
-          mkdir -p validation/sot_v4/evidence
-          cp validation/sot_v4/tgb_validation.py validation/sot_v4/verify_v4.py validation/sot_v4/README.md validation/sot_v4/evidence/
-          cp -r validation/sot_v4/differential validation/sot_v4/evidence/
-          cp validation/sot_v4/python-freeze.txt validation/sot_v4/evidence/ 2>/dev/null || true
-          cp -r validation/sot_v4/out validation/sot_v4/evidence/ 2>/dev/null || true
+          rm -rf validation/sot_v4/evidence
+          mkdir -p validation/sot_v4/evidence/source validation/sot_v4/evidence/results
+          cp validation/sot_v4/tgb_validation.py validation/sot_v4/verify_v4.py validation/sot_v4/README.md validation/sot_v4/evidence/source/
+          cp validation/sot_v4/differential/Cargo.toml validation/sot_v4/differential/Cargo.lock validation/sot_v4/evidence/source/ 2>/dev/null || true
+          mkdir -p validation/sot_v4/evidence/source/differential-src
+          cp validation/sot_v4/differential/src/main.rs validation/sot_v4/evidence/source/differential-src/
+          cp validation/sot_v4/python-freeze.txt validation/sot_v4/evidence/source/ 2>/dev/null || true
+          cp validation/sot_v4/out/*.json validation/sot_v4/evidence/results/ 2>/dev/null || true
+          cp validation/sot_v4/out/*.log validation/sot_v4/evidence/results/ 2>/dev/null || true
+          cp validation/sot_v4/out/rust-toolchain.txt validation/sot_v4/evidence/results/ 2>/dev/null || true
+          if [ -f validation/sot_v4/out/tgbl_uci_edges.tsv ]; then
+            sha256sum validation/sot_v4/out/tgbl_uci_edges.tsv > validation/sot_v4/evidence/results/tgbl_uci_edges.tsv.sha256
+            gzip -9 -c validation/sot_v4/out/tgbl_uci_edges.tsv > validation/sot_v4/evidence/results/tgbl_uci_edges.tsv.gz
+          fi
+          ls -lah validation/sot_v4/out > validation/sot_v4/evidence/results/out-listing.txt 2>&1 || true
           git rev-parse HEAD > validation/sot_v4/evidence/commit.txt
           find validation/sot_v4/evidence -type f ! -name MANIFEST.sha256 -print0 \
             | sort -z | xargs -0 sha256sum > validation/sot_v4/evidence/MANIFEST.sha256
