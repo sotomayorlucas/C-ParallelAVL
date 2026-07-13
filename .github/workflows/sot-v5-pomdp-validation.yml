@@ -1,0 +1,72 @@
+name: SOT V5 POMDPs validation
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["sot-v5-pomdp-validation"]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12.6"
+          arch: x64
+
+      - uses: julia-actions/cache@v2
+        with:
+          cache-name: sot-v5-pomdps
+
+      - name: Instantiate pinned Julia environment
+        working-directory: validation/sot_v5
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()' | tee instantiate.log
+
+      - name: Run POMDPs.jl integration
+        env:
+          SOT_V5_OUT: ${{ github.workspace }}/validation/sot_v5/out
+        run: |
+          mkdir -p validation/sot_v5/out
+          julia --project=validation/sot_v5 validation/sot_v5/run.jl 2>&1 | tee validation/sot_v5/out/julia-run.log
+
+      - name: Run independent exact checker
+        run: python3 validation/sot_v5/check.py validation/sot_v5/out/pomdps_results.json | tee validation/sot_v5/out/python-check.log
+
+      - name: Reject hidden failures
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('validation/sot_v5/out/pomdps_results.json').read_text())
+          b=json.loads(Path('validation/sot_v5/out/independent_check.json').read_text())
+          assert a['all_pass'] is True
+          assert b['all_pass'] is True
+          print('all structured gates: PASS')
+          PY
+
+      - name: Collect content-addressed evidence
+        if: always()
+        run: |
+          rm -rf validation/sot_v5/evidence
+          mkdir -p validation/sot_v5/evidence/source validation/sot_v5/evidence/results
+          cp validation/sot_v5/Project.toml validation/sot_v5/Manifest.toml validation/sot_v5/run.jl validation/sot_v5/check.py validation/sot_v5/README.md validation/sot_v5/evidence/source/ 2>/dev/null || true
+          cp validation/sot_v5/out/* validation/sot_v5/evidence/results/ 2>/dev/null || true
+          cp validation/sot_v5/instantiate.log validation/sot_v5/evidence/results/ 2>/dev/null || true
+          julia --version > validation/sot_v5/evidence/results/julia-version.txt 2>&1 || true
+          python3 --version > validation/sot_v5/evidence/results/python-version.txt 2>&1 || true
+          git rev-parse HEAD > validation/sot_v5/evidence/commit.txt
+          find validation/sot_v5/evidence -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > validation/sot_v5/evidence/MANIFEST.sha256
+
+      - name: Upload V5 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sot-v5-pomdps-validation-evidence
+          path: validation/sot_v5/evidence
+          if-no-files-found: error
