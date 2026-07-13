@@ -14,6 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Initialize immutable staging area
+        run: |
+          rm -rf "$RUNNER_TEMP/sot-v4-staging"
+          mkdir -p "$RUNNER_TEMP/sot-v4-staging"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -23,6 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install py-tgb==2.2.0
           python -m pip freeze | sort > validation/sot_v4/python-freeze.txt
+          cp validation/sot_v4/python-freeze.txt "$RUNNER_TEMP/sot-v4-staging/"
 
       - name: Run local algorithm self-test
         run: python validation/sot_v4/tgb_validation.py --self-test
@@ -37,6 +43,10 @@ jobs:
             --eval-queries 1200 \
             --cover-witnesses 128 \
             | tee validation/sot_v4/out/tgb-run.log
+          cp validation/sot_v4/out/tgb_results.json "$RUNNER_TEMP/sot-v4-staging/"
+          cp validation/sot_v4/out/tgb-run.log "$RUNNER_TEMP/sot-v4-staging/"
+          sha256sum validation/sot_v4/out/tgbl_uci_edges.tsv > "$RUNNER_TEMP/sot-v4-staging/tgbl_uci_edges.tsv.sha256"
+          gzip -9 -c validation/sot_v4/out/tgbl_uci_edges.tsv > "$RUNNER_TEMP/sot-v4-staging/tgbl_uci_edges.tsv.gz"
 
       - uses: dtolnay/rust-toolchain@1.86.0
 
@@ -50,9 +60,13 @@ jobs:
             | tee validation/sot_v4/out/differential-run.log
           rustc --version > validation/sot_v4/out/rust-toolchain.txt
           cargo --version >> validation/sot_v4/out/rust-toolchain.txt
+          cp validation/sot_v4/out/differential_results.json "$RUNNER_TEMP/sot-v4-staging/"
+          cp validation/sot_v4/out/differential-run.log validation/sot_v4/out/rust-toolchain.txt "$RUNNER_TEMP/sot-v4-staging/"
 
       - name: Cross-system acceptance gate
-        run: python validation/sot_v4/verify_v4.py validation/sot_v4/out | tee validation/sot_v4/out/verify.log
+        run: |
+          python validation/sot_v4/verify_v4.py validation/sot_v4/out | tee validation/sot_v4/out/verify.log
+          cp validation/sot_v4/out/v4_validation.json validation/sot_v4/out/verify.log "$RUNNER_TEMP/sot-v4-staging/"
 
       - name: Collect content-addressed evidence
         if: always()
@@ -63,15 +77,9 @@ jobs:
           cp validation/sot_v4/differential/Cargo.toml validation/sot_v4/differential/Cargo.lock validation/sot_v4/evidence/source/ 2>/dev/null || true
           mkdir -p validation/sot_v4/evidence/source/differential-src
           cp validation/sot_v4/differential/src/main.rs validation/sot_v4/evidence/source/differential-src/
-          cp validation/sot_v4/python-freeze.txt validation/sot_v4/evidence/source/ 2>/dev/null || true
-          cp validation/sot_v4/out/*.json validation/sot_v4/evidence/results/ 2>/dev/null || true
-          cp validation/sot_v4/out/*.log validation/sot_v4/evidence/results/ 2>/dev/null || true
-          cp validation/sot_v4/out/rust-toolchain.txt validation/sot_v4/evidence/results/ 2>/dev/null || true
-          if [ -f validation/sot_v4/out/tgbl_uci_edges.tsv ]; then
-            sha256sum validation/sot_v4/out/tgbl_uci_edges.tsv > validation/sot_v4/evidence/results/tgbl_uci_edges.tsv.sha256
-            gzip -9 -c validation/sot_v4/out/tgbl_uci_edges.tsv > validation/sot_v4/evidence/results/tgbl_uci_edges.tsv.gz
-          fi
+          cp "$RUNNER_TEMP/sot-v4-staging"/* validation/sot_v4/evidence/results/ 2>/dev/null || true
           ls -lah validation/sot_v4/out > validation/sot_v4/evidence/results/out-listing.txt 2>&1 || true
+          ls -lah "$RUNNER_TEMP/sot-v4-staging" > validation/sot_v4/evidence/results/staging-listing.txt 2>&1 || true
           git rev-parse HEAD > validation/sot_v4/evidence/commit.txt
           find validation/sot_v4/evidence -type f ! -name MANIFEST.sha256 -print0 \
             | sort -z | xargs -0 sha256sum > validation/sot_v4/evidence/MANIFEST.sha256
